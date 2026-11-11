@@ -1,0 +1,3 @@
+[workspace]
+members = ["crates/regutrace-core", "crates/regutrace-cli"]
+resolver = "3"

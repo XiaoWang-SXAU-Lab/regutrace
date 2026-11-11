@@ -1,0 +1,16 @@
+[package]
+name = "regutrace-cli"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "ReguTrace CLI: local TF-target evidence construction and SQLite store"
+repository = "https://github.com/XiaoWang-SXAU-Lab/regutrace"
+readme = "../../README.md"
+
+[dependencies]
+anyhow = "1.0.104"
+regutrace-core = { path = "../regutrace-core" }
+
+[[bin]]
+name = "regutrace"
+path = "src/main.rs"
