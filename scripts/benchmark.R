@@ -136,9 +136,11 @@ writeLines(c("tf_id\ttf_symbol\tfamily\tmotif_id",
 low_our <- max_our * 0.5
 our_file <- file.path(outdir, "our_hits.tsv")
 run_our <- function(out_file, min_score) {
-  system2(bin, c("--promoters", fasta, "--motifs", jaspar, "--tf-map", tf_map,
-                 "--pvalue", "1", "--min-score", format(min_score, digits = 12),
-                 "--out", out_file), stdout = FALSE, stderr = FALSE)
+  status <- system2(bin, c("scan", "--promoters", fasta, "--motifs", jaspar,
+                           "--tf-map", tf_map, "--pvalue", "1",
+                           "--min-score", format(min_score, digits = 12),
+                           "--out", out_file), stdout = FALSE, stderr = FALSE)
+  if (!identical(status, 0L)) stop("regutrace scan failed with status ", status)
 }
 t_our <- replicate(3, system.time(run_our(our_file, low_our))[["elapsed"]])
 our <- read.delim(our_file, check.names = FALSE)
@@ -257,9 +259,11 @@ if (!is.na(real_fa) && file.exists(real_fa)) {
   real_proms <- setNames(as.character(real), real_names)
   real_file <- file.path(outdir, "real_hits.tsv")
   run_real <- function() {
-    system2(bin, c("--promoters", real_fa, "--motifs", jaspar, "--tf-map", tf_map,
-                   "--pvalue", "1", "--min-score", format(our_sel$threshold, digits = 12),
-                   "--out", real_file), stdout = FALSE, stderr = FALSE)
+    status <- system2(bin, c("scan", "--promoters", real_fa, "--motifs", jaspar,
+                             "--tf-map", tf_map, "--pvalue", "1",
+                             "--min-score", format(our_sel$threshold, digits = 12),
+                             "--out", real_file), stdout = FALSE, stderr = FALSE)
+    if (!identical(status, 0L)) stop("regutrace scan failed with status ", status)
   }
   t_real_our <- replicate(3, system.time(run_real())[["elapsed"]])
   rh <- read.delim(real_file, check.names = FALSE)
