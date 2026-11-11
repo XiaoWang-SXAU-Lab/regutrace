@@ -131,6 +131,39 @@ AT1G00010\tG2\tpoint_validation_emsa\tA\tEMSA\tPMID:123\t123\n",
     assert_eq!(g2[14], "100");
     assert_eq!(g2[15], "+");
 
+    // Without --tf-map, TF IDs are derived from the motif header name.
+    let auto_out = dir.join("auto.tsv");
+    let auto = Command::new(bin)
+        .args([
+            "scan",
+            "--genome",
+            genome_path.to_str().unwrap(),
+            "--gff",
+            gff_path.to_str().unwrap(),
+            "--motifs",
+            motif_path.to_str().unwrap(),
+            "--promoter-len",
+            "100",
+            "--downstream",
+            "100",
+            "--pvalue",
+            "1e-3",
+            "--out",
+            auto_out.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        auto.status.success(),
+        "auto stderr: {}",
+        String::from_utf8_lossy(&auto.stderr)
+    );
+    let auto_text = std::fs::read_to_string(&auto_out).unwrap();
+    assert!(
+        auto_text.lines().any(|l| l.starts_with("TEST\tTEST\tG1\t")),
+        "{auto_text}"
+    );
+
     let db_path = dir.join("evidence.db");
     let import = Command::new(bin)
         .args([

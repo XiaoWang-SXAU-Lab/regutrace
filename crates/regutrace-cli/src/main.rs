@@ -59,7 +59,7 @@ fn usage() {
 \n\
 USAGE:\n\
   regutrace scan --genome <fa[.gz]> --gff <gff3[.gz]> --motifs <jaspar.txt> \\\n\
-    --tf-map <tf_map.tsv> --out <edges.tsv> [options]\n\
+    [--tf-map <tf_map.tsv>] --out <edges.tsv> [options]\n\
   regutrace import --db <evidence.db> --evidence <edges.tsv>\n\
   regutrace export --db <evidence.db> --out <edges.tsv>\n\
   regutrace stats --db <evidence.db>\n\
@@ -67,6 +67,7 @@ USAGE:\n\
 SCAN OPTIONS:\n\
   --promoter-len <bp>     upstream length (default 1000)\n\
   --downstream <bp>       downstream window incl. TSS (default 0; PlantRegMap uses 100)\n\
+  --tf-map <tsv>          TF–motif map (optional; derived from motif names if omitted)\n\
   --promoters <fa>        scan a promoter FASTA directly (skip genome/GFF)\n\
   --promoters-out <fa>    export extracted promoters as FASTA\n\
   --pvalue <p>            PWM hit p-value cutoff (default 1e-4)\n\
@@ -79,7 +80,8 @@ SCAN OPTIONS:\n\
   --both-strands          scan both strands (default)\n\
   -h, --help              show this help\n\
 \n\
-tf-map columns: tf_id, tf_symbol, family, motif_id (one row per TF–motif pair)\n\
+tf-map columns: tf_id, tf_symbol, family, motif_id (one row per TF–motif pair);\n\
+if omitted, tf_id/tf_symbol are taken from the motif header name\n\
 user-list columns: tf, target, evidence_type, evidence_level, method, source, pmid, condition, score, notes"
     );
 }
@@ -225,16 +227,36 @@ fn write_promoters_fasta(path: &std::path::Path, promoters: &[promoter::Promoter
 fn cmd_scan(args: &[String]) -> Result<()> {
     let args = parse_scan_args(args)?;
     let motifs_path = required(args.motifs.clone(), "--motifs")?;
-    let tf_map_path = required(args.tf_map.clone(), "--tf-map")?;
     let out_path = required(args.out.clone(), "--out")?;
 
     eprintln!("reading motifs: {}", motifs_path.display());
     let motifs = pwm::read_jaspar(&motifs_path)?;
+    let tf_map: Vec<io::TfMotif> = match &args.tf_map {
+        Some(path) => io::read_tf_map(path)?,
+        None => {
+            eprintln!("no --tf-map given; deriving TF IDs from motif names");
+            motifs
+                .iter()
+                .map(|m| {
+                    let symbol = if m.name.trim().is_empty() {
+                        m.id.clone()
+                    } else {
+                        m.name.trim().to_string()
+                    };
+                    io::TfMotif {
+                        tf_id: symbol.clone(),
+                        tf_symbol: symbol,
+                        family: String::new(),
+                        motif_id: m.id.clone(),
+                    }
+                })
+                .collect()
+        }
+    };
     let mut motif_by_id: HashMap<String, pwm::Pwm> = HashMap::new();
     for m in motifs {
         motif_by_id.entry(m.id.clone()).or_insert(m);
     }
-    let tf_map = io::read_tf_map(&tf_map_path)?;
     let annotation = match &args.annotation {
         Some(p) => io::read_annotation(p)?,
         None => HashMap::new(),

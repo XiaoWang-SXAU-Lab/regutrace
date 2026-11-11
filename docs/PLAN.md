@@ -29,7 +29,8 @@
 - `--genome`：genome FASTA（可 `.gz`）
 - `--gff`：GFF3（可 `.gz`）
 - `--motifs`：JASPAR PFM 文本（多记录）
-- `--tf-map`：TSV，列 `tf_id, tf_symbol, family, motif_id`
+- `--tf-map`：可选 TSV，列 `tf_id, tf_symbol, family, motif_id`；省略时用
+  motif header name 作为 `tf_id`/`tf_symbol`
 - `--promoter-len`：上游长度，默认 1000 bp
 - `--downstream`：TSS 下游长度，默认 0；PlantRegMap 使用 500 上游 + 100 下游
 - `--pvalue`：PWM hit 的 p 值阈值，默认 1e-4
@@ -95,8 +96,8 @@ hit_start  hit_end  strand  score  p_value  notes
 - 真实数据冒烟：Ensembl Plants release 60（27,655 genes）+ JASPAR 2024 plant
   PFMs；HSFA1E motif `MA1758.2` 扫描前 200 个 1 kb promoters，得到 67 个
   prediction hits，耗时约 3.4 s（含 genome/GFF 解析）。
-- 当前缺口：`tf-map` 仍需手工提供；未做 FDR、DAP/ChIP 边表和全基因组多 motif
-  性能优化。
+- 当前缺口：`tf-map` 可省略并按 motif name 自动填充，但 name→gene ID/家族映射
+  仍未做；未做 FDR、DAP/ChIP 边表和全基因组多 motif 性能优化。
 
 ## Benchmark（Biostrings 对照，2026-11-11）
 

@@ -42,7 +42,7 @@ Fetch a minimal Arabidopsis data pack (genome/GFF/protein + JASPAR plant PFMs):
 bash scripts/fetch-data.sh
 ```
 
-Scan promoters (1 kb upstream) with a TF→motif map:
+Scan promoters (1 kb upstream) with an optional TF→motif map:
 
 ```bash
 regutrace scan \
@@ -61,6 +61,10 @@ regutrace import --db reguledger.db --evidence evidence.tsv
 regutrace stats  --db reguledger.db
 regutrace export --db reguledger.db --out evidence_export.tsv
 ```
+
+`--tf-map` is optional. When it is omitted, `tf_id`/`tf_symbol` are taken from
+the motif header name (for example JASPAR `>MA1758.2 HSFA1E`); provide a tf-map
+when you need gene IDs or family annotations.
 
 Add `--downstream 100` to include 100 bp past the TSS; PlantRegMap uses
 TSS −500/+100, i.e. `--promoter-len 500 --downstream 100`.
@@ -108,6 +112,6 @@ docs/                    plan, evidence schema, benchmark, API plan
 - Promoter definition (length, TSS, UTR, transcript choice) strongly affects
   results; coordinates are always reported.
 - Without ATAC/ChIP, prediction cannot distinguish accessible from bound sites.
-- The current `tf-map` is user-provided; automatic JASPAR-name/annotation
-  mapping and Pfam HMM TF classification are Phase 2.
+- A `tf-map` is optional; without it, TF IDs come from motif header names.
+  Mapping those names to gene IDs and Pfam HMM TF classification remain Phase 2.
 - MIT licensed. Reference data licenses are documented by `fetch-data.sh`.
