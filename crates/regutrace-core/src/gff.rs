@@ -106,7 +106,11 @@ fn transcript_metric(
 }
 
 pub fn read_gff(path: &Path) -> Result<Vec<GeneModel>> {
-    read_gff_with_stats(path).map(|(genes, _)| genes)
+    let (genes, _) = read_gff_with_stats(path)?;
+    if genes.is_empty() {
+        bail!("no gene features found in {}", path.display());
+    }
+    Ok(genes)
 }
 
 pub fn read_gff_with_stats(path: &Path) -> Result<(Vec<GeneModel>, GffStats)> {
@@ -157,11 +161,18 @@ pub fn read_gff_with_stats(path: &Path) -> Result<(Vec<GeneModel>, GffStats)> {
         *feature_counts.entry(kind.to_string()).or_insert(0) += 1;
 
         if kind == "gene" {
-            let Some(gene_id_raw) = attr(attrs, "ID").or_else(|| attr(attrs, "Name")) else {
+            let gene_id = attr(attrs, "ID")
+                .map(|v| clean_id(&v))
+                .filter(|v| !v.is_empty())
+                .or_else(|| {
+                    attr(attrs, "Name")
+                        .map(|v| clean_id(&v))
+                        .filter(|v| !v.is_empty())
+                });
+            let Some(gene_id) = gene_id else {
                 skipped_records += 1;
                 continue;
             };
-            let gene_id = clean_id(&gene_id_raw);
             let symbol = attr(attrs, "Name")
                 .or_else(|| attr(attrs, "gene_name"))
                 .unwrap_or_else(|| gene_id.clone());
@@ -180,17 +191,21 @@ pub fn read_gff_with_stats(path: &Path) -> Result<(Vec<GeneModel>, GffStats)> {
                 skipped_records += 1;
                 continue;
             };
+            let explicit_id = attr(attrs, "ID").map(|v| clean_id(&v));
+            if explicit_id.as_deref() == Some("") {
+                skipped_records += 1;
+                continue;
+            }
+            let mut usable = false;
             for parent_raw in parent_raw.split(',') {
                 let parent = clean_id(parent_raw);
                 if parent.is_empty() {
-                    skipped_records += 1;
                     continue;
                 }
-                let transcript_id = attr(attrs, "ID")
-                    .map(|v| clean_id(&v))
-                    .unwrap_or_else(|| {
-                        format!("{parent}.t{}", tx.get(&parent).map_or(1, |v| v.len() + 1))
-                    });
+                usable = true;
+                let transcript_id = explicit_id.clone().unwrap_or_else(|| {
+                    format!("{parent}.t{}", tx.get(&parent).map_or(1, |v| v.len() + 1))
+                });
                 tx.entry(parent).or_default().push(TxInfo {
                     transcript_id,
                     start,
@@ -199,18 +214,22 @@ pub fn read_gff_with_stats(path: &Path) -> Result<(Vec<GeneModel>, GffStats)> {
                     strand,
                 });
             }
+            if !usable {
+                skipped_records += 1;
+            }
         } else if matches!(kind, "exon" | "CDS" | "five_prime_UTR" | "three_prime_UTR") {
             let Some(parent_raw) = attr(attrs, "Parent") else {
                 skipped_records += 1;
                 continue;
             };
             let len = end - start + 1;
+            let mut usable = false;
             for parent_raw in parent_raw.split(',') {
                 let transcript_id = clean_id(parent_raw);
                 if transcript_id.is_empty() {
-                    skipped_records += 1;
                     continue;
                 }
+                usable = true;
                 let entry = feature_span
                     .entry(transcript_id.clone())
                     .or_insert((chrom.clone(), strand, start, end));
@@ -224,6 +243,9 @@ pub fn read_gff_with_stats(path: &Path) -> Result<(Vec<GeneModel>, GffStats)> {
                     "CDS" => *cds_len.entry(transcript_id).or_insert(0) += len,
                     _ => *utr_len.entry(transcript_id).or_insert(0) += len,
                 }
+            }
+            if !usable {
+                skipped_records += 1;
             }
         }
     }
@@ -362,9 +384,6 @@ pub fn read_gff_with_stats(path: &Path) -> Result<(Vec<GeneModel>, GffStats)> {
         });
     }
     out.sort_by(|a, b| a.gene_id.cmp(&b.gene_id));
-    if out.is_empty() {
-        bail!("no gene features found in {}", path.display());
-    }
     Ok((out, stats))
 }
 
@@ -608,6 +627,80 @@ mod tests {
         let (genes, stats) = read_gff_with_stats(&path).unwrap();
         assert_eq!(genes.len(), 1);
         assert_eq!(stats.skipped_records, 1);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn rejects_empty_normalized_gene_id() {
+        let path = std::env::temp_dir().join(format!(
+            "regutrace_gff_emptyid_{}.gff3",
+            std::process::id()
+        ));
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            writeln!(f, "Chr1\ttest\tgene\t100\t500\t.\t+\t.\tID=g1").unwrap();
+            writeln!(f, "Chr1\ttest\tgene\t600\t700\t.\t+\t.\tID=gene:").unwrap();
+        }
+        let (genes, stats) = read_gff_with_stats(&path).unwrap();
+        assert_eq!(genes.len(), 1);
+        assert_eq!(stats.skipped_records, 1);
+        assert!(genes.iter().all(|g| !g.gene_id.is_empty()));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn rejects_empty_normalized_transcript_id() {
+        let path = std::env::temp_dir().join(format!(
+            "regutrace_gff_emptytx_{}.gff3",
+            std::process::id()
+        ));
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            writeln!(f, "Chr1\ttest\tgene\t100\t500\t.\t+\t.\tID=g1").unwrap();
+            writeln!(
+                f,
+                "Chr1\ttest\tmRNA\t100\t500\t.\t+\t.\tID=transcript:;Parent=g1"
+            )
+            .unwrap();
+        }
+        let (genes, stats) = read_gff_with_stats(&path).unwrap();
+        assert_eq!(genes.len(), 1);
+        assert_eq!(stats.transcripts, 0);
+        assert_eq!(stats.skipped_records, 1);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn counts_parent_slots_once() {
+        let path = std::env::temp_dir().join(format!(
+            "regutrace_gff_parentslots_{}.gff3",
+            std::process::id()
+        ));
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            writeln!(f, "Chr1\ttest\tCDS\t600\t700\t.\t+\t0\tParent=,,g2").unwrap();
+        }
+        let (genes, stats) = read_gff_with_stats(&path).unwrap();
+        assert_eq!(genes.len(), 1);
+        assert_eq!(genes[0].gene_id, "g2");
+        assert_eq!(stats.skipped_records, 0);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn returns_stats_for_all_skipped_file() {
+        let path = std::env::temp_dir().join(format!(
+            "regutrace_gff_allskipped_{}.gff3",
+            std::process::id()
+        ));
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            writeln!(f, "Chr1\ttest\tgene\t100\t500\t.\t+\t.\tID=gene:").unwrap();
+        }
+        let (genes, stats) = read_gff_with_stats(&path).unwrap();
+        assert!(genes.is_empty());
+        assert_eq!(stats.skipped_records, 1);
+        assert!(read_gff(&path).is_err());
         let _ = std::fs::remove_file(path);
     }
 

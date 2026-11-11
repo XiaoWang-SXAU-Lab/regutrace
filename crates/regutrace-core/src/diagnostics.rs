@@ -283,6 +283,20 @@ pub fn review_fasta(fa: &Fasta, path: &Path, report: &mut Report) -> FastaStats 
 }
 
 pub fn review_gff(genes: &[GeneModel], stats: &GffStats, path: &Path, report: &mut Report) {
+    if stats.skipped_records > 0 {
+        report.push(
+            Diagnostic::warning(
+                "GFF_SKIPPED_RECORDS",
+                format!(
+                    "{} feature record(s) lacked a required ID/Parent and were skipped",
+                    stats.skipped_records
+                ),
+            )
+            .with_file(path)
+            .with_context("count", stats.skipped_records)
+            .with_suggestion("check GFF ID/Parent attributes; skipped records do not contribute models"),
+        );
+    }
     if genes.is_empty() {
         report.push(
             Diagnostic::error("GFF_NO_GENES", "no gene/transcript models were found")
@@ -309,20 +323,6 @@ pub fn review_gff(genes: &[GeneModel], stats: &GffStats, path: &Path, report: &m
         .with_context("genes", stats.genes)
         .with_context("transcripts", stats.transcripts),
     );
-    if stats.skipped_records > 0 {
-        report.push(
-            Diagnostic::warning(
-                "GFF_SKIPPED_RECORDS",
-                format!(
-                    "{} feature record(s) lacked a required ID/Parent and were skipped",
-                    stats.skipped_records
-                ),
-            )
-            .with_file(path)
-            .with_context("count", stats.skipped_records)
-            .with_suggestion("check GFF ID/Parent attributes; skipped records do not contribute models"),
-        );
-    }
     if stats.inferred_genes > 0 || stats.inferred_transcripts > 0 {
         report.push(
             Diagnostic::info(
