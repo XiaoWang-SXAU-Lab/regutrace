@@ -12,7 +12,9 @@ separate from experimental evidence.
 ## Status
 
 Phase 1: CLI + SQLite evidence store + synthetic/Biostrings benchmark.
-HTTP API and dashboard integration are Phase 3.
+The wgcna-dashboard toolkit (`/toolkits/regutrace`) bundles the CLI and JASPAR 2024 CORE motif libraries for seven taxa,
+with local TF–target scans, free-text queries, and promoter binding-site
+visualization.
 
 ## Evidence levels
 
@@ -90,6 +92,35 @@ regutrace validate \
 `scan` also accepts `--report-json`. Reports use stable codes, severities,
 context and suggestions for frontends and RAG assistants; see
 [docs/DIAGNOSTICS.md](docs/DIAGNOSTICS.md).
+
+## Large scans, streaming and progress
+
+A whole-genome scan with hundreds of motifs can emit millions of rows. Add
+`--stream` to write the evidence TSV incrementally instead of retaining every
+row in memory (rows are in scan order, not sorted), and `--progress-json` to
+publish stage/progress for a frontend. Scanning is parallel by default, using
+`CPU cores - 1` worker threads; set `--threads N` explicitly or `--threads 1`
+for serial execution:
+
+```bash
+regutrace scan \
+  --genome genome.fa --gff annotation.gff3 --motifs jaspar_plants.txt \
+  --promoter-len 1000 --pvalue 1e-4 \
+  --out evidence.tsv --stream --threads 8 \
+  --progress-json progress.json --report-json report.json
+```
+
+`progress.json` is updated atomically with fields `stage`, `status`, `done`,
+`total`, `progress` and `message`. Stages include `reading_motifs`,
+`reading_genome`, `reading_gff`, `extracting_promoters`, `scanning`,
+`writing_evidence`, `done` and `failed`. The dashboard toolkit consumes this
+file, indexes the evidence TSV on disk by TF/target/motif, and keeps queries
+interactive without loading millions of rows into memory.
+
+On a Tartary buckwheat benchmark (2,000 promoters × 805 JASPAR motifs), 7
+worker threads reduced the scan from 59 s to 17.2 s (about 3.4×) with identical
+528,201 hits. The default is `available_parallelism() - 1`; use `--threads 1`
+for the old serial behaviour.
 
 ## Evidence schema
 

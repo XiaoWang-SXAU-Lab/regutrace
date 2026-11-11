@@ -5,10 +5,14 @@
 //!     --motifs jaspar_plants.txt --tf-map tf_map.tsv \
 //!     --promoter-len 1000 --pvalue 1e-4 --out evidence.tsv
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
+use rayon::prelude::*;
 use regutrace_core::{diagnostics, fasta, gff, io, promoter, pwm, scan, store::Store};
 
 struct Args {
@@ -29,6 +33,9 @@ struct Args {
     both_strands: bool,
     max_genes: Option<usize>,
     report_json: Option<PathBuf>,
+    progress_json: Option<PathBuf>,
+    stream: bool,
+    threads: Option<usize>,
     strict: bool,
 }
 
@@ -52,6 +59,9 @@ impl Default for Args {
             both_strands: true,
             max_genes: None,
             report_json: None,
+            progress_json: None,
+            stream: false,
+            threads: None,
             strict: false,
         }
     }
@@ -86,6 +96,9 @@ SCAN OPTIONS:\n\
   --one-strand            scan only the plus strand of each promoter\n\
   --both-strands          scan both strands (default)\n\
   --report-json <path>    write a machine-readable diagnostics report\n\
+  --progress-json <path>  write live stage/progress JSON for frontends\n\
+  --stream                write evidence rows incrementally (unsorted; large scans)\n\
+  --threads <n>           scan worker threads (default CPU cores - 1; 1 = serial)\n\
   --strict                treat warnings as failure (validate)\n\
   -h, --help              show this help\n\
 \n\
@@ -192,6 +205,24 @@ fn parse_scan_args(args: &[String]) -> Result<Args> {
                     it.next().context("--report-json needs a value")?,
                 ))
             }
+            "--progress-json" => {
+                a.progress_json = Some(PathBuf::from(
+                    it.next().context("--progress-json needs a value")?,
+                ))
+            }
+            "--stream" => a.stream = true,
+            "--threads" => {
+                let n: usize = it
+                    .next()
+                    .context("--threads needs a value")?
+                    .parse()
+                    .context("invalid --threads")?;
+                if n == 0 {
+                    a.threads = None;
+                } else {
+                    a.threads = Some(n);
+                }
+            }
             "--strict" => a.strict = true,
             "--one-strand" => a.both_strands = false,
             "--both-strands" => a.both_strands = true,
@@ -208,11 +239,171 @@ fn parse_scan_args(args: &[String]) -> Result<Args> {
     if !(0.0..=1.0).contains(&a.pvalue) {
         bail!("--pvalue must be in [0, 1]");
     }
+    if a.threads.is_some_and(|n| n > 256) {
+        bail!("--threads must be between 1 and 256");
+    }
     Ok(a)
 }
 
 fn required<T>(v: Option<T>, name: &str) -> Result<T> {
     v.with_context(|| format!("missing required argument {name}"))
+}
+
+fn effective_threads(requested: Option<usize>) -> usize {
+    if let Some(n) = requested {
+        if n > 0 {
+            return n;
+        }
+    }
+    std::thread::available_parallelism()
+        .map(|n| n.get().saturating_sub(1).max(1))
+        .unwrap_or(1)
+}
+
+/// Writes a small progress document for the dashboard. Updates are throttled
+/// so scanning hundreds of thousands of promoter-motif pairs does not turn
+/// progress reporting into the bottleneck. The file is replaced atomically so
+/// a polling reader never sees a partial document.
+struct ProgressWriter {
+    path: Option<PathBuf>,
+    last_write: Instant,
+    last_progress: f64,
+}
+
+impl ProgressWriter {
+    fn new(path: Option<PathBuf>) -> Self {
+        Self {
+            path,
+            // Allow the first update immediately.
+            last_write: Instant::now() - Duration::from_secs(1),
+            last_progress: -1.0,
+        }
+    }
+
+    fn write(
+        &mut self,
+        stage: &str,
+        status: &str,
+        done: u64,
+        total: u64,
+        message: &str,
+        force: bool,
+    ) {
+        let Some(path) = &self.path else {
+            return;
+        };
+        let progress = if total == 0 {
+            0.0
+        } else {
+            (done as f64 / total as f64).clamp(0.0, 1.0)
+        };
+        if !force
+            && self.last_write.elapsed() < Duration::from_millis(250)
+            && (progress - self.last_progress).abs() < 0.005
+        {
+            return;
+        }
+        let doc = serde_json::json!({
+            "stage": stage,
+            "status": status,
+            "done": done,
+            "total": total,
+            "progress": progress,
+            "message": message,
+        });
+        let Ok(text) = serde_json::to_string_pretty(&doc) else {
+            return;
+        };
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+        }
+        let tmp = path.with_extension("json.tmp");
+        if std::fs::write(&tmp, &text).is_ok() {
+            // rename over an existing file is not portable on Windows.
+            let _ = std::fs::remove_file(path);
+            if std::fs::rename(&tmp, path).is_err() {
+                let _ = std::fs::write(path, &text);
+            }
+        }
+        self.last_write = Instant::now();
+        self.last_progress = progress;
+    }
+}
+
+struct ChunkScan {
+    edges: Vec<io::EdgeRecord>,
+    hits: usize,
+}
+
+enum EdgeSink {
+    Stream(Mutex<io::EdgeStream>),
+    Memory(Mutex<Vec<io::EdgeRecord>>),
+}
+
+fn scan_chunk(
+    promoters: &[promoter::Promoter],
+    motif_ids: &[String],
+    motif_to_tfs: &BTreeMap<String, Vec<&io::TfMotif>>,
+    scanners: &HashMap<String, scan::Scanner>,
+    annotation: &HashMap<String, String>,
+    pvalue: f64,
+    min_score: Option<f64>,
+    both_strands: bool,
+    done: &AtomicU64,
+) -> ChunkScan {
+    let mut edges = Vec::new();
+    let mut hits_count = 0usize;
+    for prom in promoters {
+        for motif_id in motif_ids {
+            let tfs = motif_to_tfs
+                .get(motif_id)
+                .expect("motif id comes from the same map");
+            let scanner = scanners
+                .get(motif_id)
+                .expect("scanner exists for every motif");
+            let hits = scanner.scan(&prom.seq, pvalue, min_score, both_strands);
+            for hit in hits {
+                hits_count += 1;
+                for tf in tfs {
+                    edges.push(io::EdgeRecord {
+                        tf_id: tf.tf_id.clone(),
+                        tf_symbol: if tf.tf_symbol.is_empty() {
+                            tf.tf_id.clone()
+                        } else {
+                            tf.tf_symbol.clone()
+                        },
+                        target_id: prom.gene_id.clone(),
+                        target_symbol: annotation
+                            .get(&prom.gene_id)
+                            .cloned()
+                            .unwrap_or_else(|| prom.symbol.clone()),
+                        evidence_type: "prediction_motif".into(),
+                        evidence_level: "D".into(),
+                        method: "jaspar_pwm".into(),
+                        source: "promoter_scan".into(),
+                        pmid: String::new(),
+                        condition: String::new(),
+                        promoter_start: (prom.start > 0).then_some(prom.start),
+                        promoter_end: (prom.end > 0).then_some(prom.end),
+                        motif_id: motif_id.clone(),
+                        hit_start: Some(hit.start),
+                        hit_end: Some(hit.end),
+                        strand: hit.strand.to_string(),
+                        score: Some(hit.score),
+                        p_value: Some(hit.p_value),
+                        notes: format!("family={}", tf.family),
+                    });
+                }
+            }
+        }
+        done.fetch_add(motif_ids.len() as u64, Ordering::Relaxed);
+    }
+    ChunkScan {
+        edges,
+        hits: hits_count,
+    }
 }
 
 fn write_promoters_fasta(path: &std::path::Path, promoters: &[promoter::Promoter]) -> Result<()> {
@@ -249,6 +440,16 @@ fn report_path_from_args(raw: &[String]) -> Option<PathBuf> {
     None
 }
 
+fn progress_path_from_args(raw: &[String]) -> Option<PathBuf> {
+    let mut it = raw.iter();
+    while let Some(arg) = it.next() {
+        if arg == "--progress-json" {
+            return it.next().map(PathBuf::from);
+        }
+    }
+    None
+}
+
 fn write_argument_error_report(
     command: &str,
     path: &Option<PathBuf>,
@@ -274,15 +475,33 @@ fn write_argument_error_report(
 
 fn cmd_validate(raw: &[String]) -> Result<()> {
     let report_path = report_path_from_args(raw);
+    let progress_path = progress_path_from_args(raw);
     let args = match parse_scan_args(raw) {
         Ok(args) => args,
         Err(e) => {
             write_argument_error_report("validate", &report_path, &e)?;
+            ProgressWriter::new(progress_path).write(
+                "failed",
+                "error",
+                0,
+                0,
+                &format!("{e:#}"),
+                true,
+            );
             return Err(e);
         }
     };
+    let mut progress = ProgressWriter::new(args.progress_json.clone());
+    progress.write(
+        "validating",
+        "running",
+        0,
+        1,
+        "validating inputs",
+        true,
+    );
     let mut report = diagnostics::Report::new("validate");
-    let result = run_validate(&args, &mut report);
+    let result = run_validate(&args, &mut report, &mut progress);
     if let Err(e) = &result {
         report.push(diagnostics::Diagnostic::error(
             "VALIDATE_FAILED",
@@ -302,17 +521,31 @@ fn cmd_validate(raw: &[String]) -> Result<()> {
         report.write_json(path)?;
     }
     if report.has_errors() {
+        progress.write("failed", "error", 0, 0, "input validation failed", true);
         return Err(anyhow::anyhow!("input validation failed"));
     }
+    progress.write("done", "done", 1, 1, "validation complete", true);
     Ok(())
 }
 
-fn run_validate(args: &Args, report: &mut diagnostics::Report) -> Result<()> {
+fn run_validate(
+    args: &Args,
+    report: &mut diagnostics::Report,
+    progress: &mut ProgressWriter,
+) -> Result<()> {
     let mut any = false;
 
     let motifs = if let Some(path) = &args.motifs {
         any = true;
         report.add_input("motifs", path);
+        progress.write(
+            "reading_motifs",
+            "running",
+            0,
+            1,
+            "reading motif library",
+            true,
+        );
         let motifs = pwm::read_jaspar(path)?;
         diagnostics::review_motifs(&motifs, path, report);
         Some(motifs)
@@ -385,8 +618,10 @@ fn run_validate(args: &Args, report: &mut diagnostics::Report) -> Result<()> {
         let gff_path = args.gff.as_ref().context("--genome requires --gff")?;
         report.add_input("genome", genome_path);
         report.add_input("gff", gff_path);
+        progress.write("reading_genome", "running", 0, 1, "reading genome FASTA", true);
         let fa = fasta::read_fasta(genome_path)?;
         diagnostics::review_fasta(&fa, genome_path, report);
+        progress.write("reading_gff", "running", 0, 1, "reading GFF3", true);
         let (genes, gff_stats) = gff::read_gff_with_stats(gff_path)?;
         diagnostics::review_gff(&genes, &gff_stats, gff_path, report);
         diagnostics::review_chromosomes(&genes, &fa, gff_path, genome_path, report);
@@ -443,20 +678,35 @@ fn run_validate(args: &Args, report: &mut diagnostics::Report) -> Result<()> {
 
 fn cmd_scan(raw: &[String]) -> Result<()> {
     let report_path = report_path_from_args(raw);
+    let progress_path = progress_path_from_args(raw);
     let args = match parse_scan_args(raw) {
         Ok(args) => args,
         Err(e) => {
             write_argument_error_report("scan", &report_path, &e)?;
+            ProgressWriter::new(progress_path).write(
+                "failed",
+                "error",
+                0,
+                0,
+                &format!("{e:#}"),
+                true,
+            );
             return Err(e);
         }
     };
+    let mut progress = ProgressWriter::new(args.progress_json.clone());
+    progress.write("starting", "running", 0, 1, "starting scan", true);
     let mut report = diagnostics::Report::new("scan");
-    let result = run_scan(&args, &mut report);
-    if let Err(e) = &result {
-        report.push(diagnostics::Diagnostic::error(
-            "SCAN_FAILED",
-            format!("{e:#}"),
-        ));
+    let result = run_scan(&args, &mut report, &mut progress);
+    match &result {
+        Ok(()) => progress.write("done", "done", 1, 1, "scan complete", true),
+        Err(e) => {
+            report.push(diagnostics::Diagnostic::error(
+                "SCAN_FAILED",
+                format!("{e:#}"),
+            ));
+            progress.write("failed", "error", 0, 0, &format!("{e:#}"), true);
+        }
     }
     for line in report.human_lines() {
         eprintln!("{line}");
@@ -467,11 +717,16 @@ fn cmd_scan(raw: &[String]) -> Result<()> {
     result
 }
 
-fn run_scan(args: &Args, report: &mut diagnostics::Report) -> Result<()> {
+fn run_scan(
+    args: &Args,
+    report: &mut diagnostics::Report,
+    progress: &mut ProgressWriter,
+) -> Result<()> {
     let motifs_path = required(args.motifs.clone(), "--motifs")?;
     let out_path = required(args.out.clone(), "--out")?;
     report.add_input("motifs", &motifs_path);
 
+    progress.write("reading_motifs", "running", 0, 1, "reading motif library", true);
     eprintln!("reading motifs: {}", motifs_path.display());
     let motifs = pwm::read_jaspar(&motifs_path)?;
     diagnostics::review_motifs(&motifs, &motifs_path, report);
@@ -519,6 +774,14 @@ fn run_scan(args: &Args, report: &mut diagnostics::Report) -> Result<()> {
     };
 
     let (promoters, gene_count, missing_chrom) = if let Some(promoters_path) = &args.promoters {
+        progress.write(
+            "reading_promoters",
+            "running",
+            0,
+            1,
+            "reading promoter FASTA",
+            true,
+        );
         eprintln!("reading promoter FASTA: {}", promoters_path.display());
         report.add_input("promoters", promoters_path);
         let fa = fasta::read_fasta(promoters_path)?;
@@ -545,9 +808,18 @@ fn run_scan(args: &Args, report: &mut diagnostics::Report) -> Result<()> {
         let gff_path = required(args.gff.clone(), "--gff")?;
         report.add_input("genome", &genome_path);
         report.add_input("gff", &gff_path);
+        progress.write(
+            "reading_genome",
+            "running",
+            0,
+            1,
+            "reading genome FASTA",
+            true,
+        );
         eprintln!("reading genome: {}", genome_path.display());
         let genome = fasta::read_fasta(&genome_path)?;
         diagnostics::review_fasta(&genome, &genome_path, report);
+        progress.write("reading_gff", "running", 0, 1, "reading GFF3", true);
         eprintln!("reading GFF: {}", gff_path.display());
         let (genes, gff_stats) = gff::read_gff_with_stats(&gff_path)?;
         diagnostics::review_gff(&genes, &gff_stats, &gff_path, report);
@@ -555,9 +827,17 @@ fn run_scan(args: &Args, report: &mut diagnostics::Report) -> Result<()> {
         if let Some(path) = &args.annotation {
             diagnostics::review_annotation(&annotation, &genes, path, report);
         }
+        progress.write(
+            "extracting_promoters",
+            "running",
+            0,
+            genes.len() as u64,
+            "extracting promoters",
+            true,
+        );
         let mut v = Vec::new();
         let mut missing = 0usize;
-        for gene in &genes {
+        for (i, gene) in genes.iter().enumerate() {
             if args.max_genes.is_some_and(|n| v.len() >= n) {
                 break;
             }
@@ -570,6 +850,16 @@ fn run_scan(args: &Args, report: &mut diagnostics::Report) -> Result<()> {
                     }
                 }
                 None => missing += 1,
+            }
+            if i % 1000 == 0 {
+                progress.write(
+                    "extracting_promoters",
+                    "running",
+                    i as u64,
+                    genes.len() as u64,
+                    "extracting promoters",
+                    false,
+                );
             }
         }
         diagnostics::review_promoters(
@@ -589,13 +879,21 @@ fn run_scan(args: &Args, report: &mut diagnostics::Report) -> Result<()> {
         bail!("no promoters available; check inputs and chromosome naming");
     }
     if let Some(path) = &args.promoters_out {
+        progress.write(
+            "writing_promoters",
+            "running",
+            0,
+            1,
+            "writing promoter FASTA",
+            true,
+        );
         write_promoters_fasta(path, &promoters)?;
         eprintln!("wrote promoter FASTA: {}", path.display());
     }
 
     // Motif -> TF mappings: scan each motif once per promoter, then emit all TFs
     // that use it.
-    let mut motif_to_tfs: HashMap<String, Vec<&io::TfMotif>> = HashMap::new();
+    let mut motif_to_tfs: BTreeMap<String, Vec<&io::TfMotif>> = BTreeMap::new();
     let mut missing_motif = 0usize;
     for tf in &tf_map {
         if !motif_by_id.contains_key(&tf.motif_id) {
@@ -620,47 +918,130 @@ fn run_scan(args: &Args, report: &mut diagnostics::Report) -> Result<()> {
         );
     }
 
-    let mut edges: Vec<io::EdgeRecord> = Vec::new();
-    let mut prediction_hits = 0usize;
-    for prom in &promoters {
-        for (motif_id, tfs) in &motif_to_tfs {
-            let scanner = scanners.get(motif_id).unwrap();
-            let hits = scanner.scan(&prom.seq, args.pvalue, args.min_score, args.both_strands);
-            for hit in hits {
-                prediction_hits += 1;
-                for tf in tfs {
-                    edges.push(io::EdgeRecord {
-                        tf_id: tf.tf_id.clone(),
-                        tf_symbol: if tf.tf_symbol.is_empty() {
-                            tf.tf_id.clone()
-                        } else {
-                            tf.tf_symbol.clone()
-                        },
-                        target_id: prom.gene_id.clone(),
-                        target_symbol: annotation
-                            .get(&prom.gene_id)
-                            .cloned()
-                            .unwrap_or_else(|| prom.symbol.clone()),
-                        evidence_type: "prediction_motif".into(),
-                        evidence_level: "D".into(),
-                        method: "jaspar_pwm".into(),
-                        source: "promoter_scan".into(),
-                        pmid: String::new(),
-                        condition: String::new(),
-                        promoter_start: (prom.start > 0).then_some(prom.start),
-                        promoter_end: (prom.end > 0).then_some(prom.end),
-                        motif_id: motif_id.clone(),
-                        hit_start: Some(hit.start),
-                        hit_end: Some(hit.end),
-                        strand: hit.strand.to_string(),
-                        score: Some(hit.score),
-                        p_value: Some(hit.p_value),
-                        notes: format!("family={}", tf.family),
-                    });
-                }
+    let threads = effective_threads(args.threads);
+    let pool = if threads > 1 {
+        Some(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .context("create scan thread pool")?,
+        )
+    } else {
+        None
+    };
+    if args.stream {
+        if let Some(parent) = out_path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("create output directory {}", parent.display()))?;
             }
         }
     }
+    let sink = if args.stream {
+        Arc::new(EdgeSink::Stream(Mutex::new(io::EdgeStream::create(
+            &out_path,
+        )?)))
+    } else {
+        Arc::new(EdgeSink::Memory(Mutex::new(Vec::new())))
+    };
+    let motif_ids: Vec<String> = motif_to_tfs.keys().cloned().collect();
+    let total_work = promoters.len() as u64 * motif_ids.len() as u64;
+    let chunk_size = if threads <= 1 {
+        64
+    } else {
+        (promoters.len() / (threads * 8)).clamp(1, 64)
+    };
+    let chunks: Vec<&[promoter::Promoter]> = promoters.chunks(chunk_size).collect();
+    let done = Arc::new(AtomicU64::new(0));
+    let hits = Arc::new(AtomicU64::new(0));
+    let edge_count = Arc::new(AtomicU64::new(0));
+    progress.write(
+        "scanning",
+        "running",
+        0,
+        total_work,
+        "scanning promoters",
+        true,
+    );
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let reporter = if args.progress_json.is_some() {
+        let done = done.clone();
+        let stop = stop.clone();
+        let path = args.progress_json.clone();
+        Some(std::thread::spawn(move || {
+            let mut p = ProgressWriter::new(path);
+            while !stop.load(Ordering::Relaxed) {
+                p.write(
+                    "scanning",
+                    "running",
+                    done.load(Ordering::Relaxed),
+                    total_work,
+                    "scanning promoters",
+                    false,
+                );
+                std::thread::sleep(Duration::from_millis(250));
+            }
+        }))
+    } else {
+        None
+    };
+
+    let handle_chunk = |chunk: &[promoter::Promoter]| -> Result<()> {
+        let scanned = scan_chunk(
+            chunk,
+            &motif_ids,
+            &motif_to_tfs,
+            &scanners,
+            &annotation,
+            args.pvalue,
+            args.min_score,
+            args.both_strands,
+            &done,
+        );
+        hits.fetch_add(scanned.hits as u64, Ordering::Relaxed);
+        edge_count.fetch_add(scanned.edges.len() as u64, Ordering::Relaxed);
+        match sink.as_ref() {
+            EdgeSink::Stream(stream) => {
+                let mut w = stream
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("evidence writer lock poisoned"))?;
+                for e in &scanned.edges {
+                    w.write(e)?;
+                }
+            }
+            EdgeSink::Memory(memory) => {
+                let mut v = memory
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("evidence buffer lock poisoned"))?;
+                v.extend(scanned.edges);
+            }
+        }
+        Ok(())
+    };
+
+    let scan_result = if let Some(pool) = &pool {
+        pool.install(|| chunks.par_iter().try_for_each(|chunk| handle_chunk(chunk)))
+    } else {
+        chunks.iter().try_for_each(|chunk| handle_chunk(chunk))
+    };
+    stop.store(true, Ordering::Relaxed);
+    if let Some(h) = reporter {
+        let _ = h.join();
+    }
+    if scan_result.is_ok() {
+        progress.write(
+            "scanning",
+            "running",
+            total_work,
+            total_work,
+            "scan complete",
+            true,
+        );
+    }
+    scan_result?;
+    let prediction_hits = hits.load(Ordering::Relaxed) as usize;
+    let mut edge_count = edge_count.load(Ordering::Relaxed) as usize;
 
     let user_count = match &args.user_list {
         Some(path) => {
@@ -684,28 +1065,69 @@ fn run_scan(args: &Args, report: &mut diagnostics::Report) -> Result<()> {
                 }
             }
             let n = user.len();
-            edges.extend(user);
+            edge_count += n;
+            match sink.as_ref() {
+                EdgeSink::Stream(stream) => {
+                    let mut w = stream
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("evidence writer lock poisoned"))?;
+                    for e in &user {
+                        w.write(e)?;
+                    }
+                }
+                EdgeSink::Memory(memory) => {
+                    let mut v = memory
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("evidence buffer lock poisoned"))?;
+                    v.extend(user);
+                }
+            }
             n
         }
         None => 0,
     };
 
-    if let Some(parent) = out_path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("create output directory {}", parent.display()))?;
+    progress.write(
+        "writing_evidence",
+        "running",
+        0,
+        1,
+        "writing evidence table",
+        true,
+    );
+    match sink.as_ref() {
+        EdgeSink::Stream(stream) => {
+            let mut w = stream
+                .lock()
+                .map_err(|_| anyhow::anyhow!("evidence writer lock poisoned"))?;
+            w.flush()?;
+        }
+        EdgeSink::Memory(memory) => {
+            let mut edges = {
+                let mut v = memory
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("evidence buffer lock poisoned"))?;
+                std::mem::take(&mut *v)
+            };
+            if let Some(parent) = out_path.parent() {
+                if !parent.as_os_str().is_empty() {
+                    std::fs::create_dir_all(parent)
+                        .with_context(|| format!("create output directory {}", parent.display()))?;
+                }
+            }
+            io::write_edges(&out_path, &mut edges)?;
         }
     }
-    io::write_edges(&out_path, &mut edges)?;
 
     eprintln!(
-        "motifs: {}, TF–motif pairs: {}, promoters: {}, prediction hits: {}, user edges: {}, total edges: {}",
+        "motifs: {}, TF–motif pairs: {}, promoters: {}, prediction hits: {}, user edges: {}, total edges: {}, threads: {}",
         motif_to_tfs.len(),
         tf_map.len() - missing_motif,
         promoters.len(),
         prediction_hits,
         user_count,
-        edges.len()
+        edge_count,
+        threads
     );
     eprintln!("wrote {}", out_path.display());
     report.push(
@@ -717,10 +1139,18 @@ fn run_scan(args: &Args, report: &mut diagnostics::Report) -> Result<()> {
                 promoters.len(),
                 prediction_hits,
                 user_count,
-                edges.len()
+                edge_count
             ),
         )
-        .with_context("output", out_path.display().to_string()),
+        .with_context("output", out_path.display().to_string())
+        .with_context("genes", gene_count)
+        .with_context("promoters", promoters.len())
+        .with_context("motif_hits", prediction_hits)
+        .with_context("user_rows", user_count)
+        .with_context("total_edges", edge_count)
+        .with_context("motifs_scanned", motif_to_tfs.len())
+        .with_context("tf_motif_pairs", tf_map.len() - missing_motif)
+        .with_context("threads", threads),
     );
     Ok(())
 }

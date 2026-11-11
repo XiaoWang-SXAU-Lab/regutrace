@@ -69,6 +69,7 @@ AT1G00010\tG2\tpoint_validation_emsa\tA\tEMSA\tPMID:123\t123\n",
     );
     let out_path = dir.join("out.tsv");
     let scan_report = dir.join("scan-report.json");
+    let progress_path = dir.join("progress.json");
 
     let bin = env!("CARGO_BIN_EXE_regutrace");
     let output = Command::new(bin)
@@ -96,6 +97,8 @@ AT1G00010\tG2\tpoint_validation_emsa\tA\tEMSA\tPMID:123\t123\n",
             out_path.to_str().unwrap(),
             "--report-json",
             scan_report.to_str().unwrap(),
+            "--progress-json",
+            progress_path.to_str().unwrap(),
         ])
         .output()
         .unwrap();
@@ -120,6 +123,14 @@ AT1G00010\tG2\tpoint_validation_emsa\tA\tEMSA\tPMID:123\t123\n",
         .unwrap()
         .iter()
         .any(|d| d["code"] == "SCAN_SUMMARY"));
+
+    let progress_json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&progress_path).unwrap()).unwrap();
+    assert_eq!(progress_json["status"], "done");
+    assert_eq!(progress_json["stage"], "done");
+    assert_eq!(progress_json["progress"], 1.0);
+    assert_eq!(progress_json["done"], 1);
+    assert_eq!(progress_json["total"], 1);
 
     let rows: Vec<Vec<&str>> = text.lines().skip(1).map(|l| l.split('\t').collect()).collect();
     // Columns: 0 tf_id, 1 tf_symbol, 2 target_id, 3 target_symbol, 4 evidence_type,
@@ -163,6 +174,8 @@ AT1G00010\tG2\tpoint_validation_emsa\tA\tEMSA\tPMID:123\t123\n",
             "1e-3",
             "--out",
             auto_out.to_str().unwrap(),
+            "--threads",
+            "1",
         ])
         .output()
         .unwrap();
@@ -176,6 +189,55 @@ AT1G00010\tG2\tpoint_validation_emsa\tA\tEMSA\tPMID:123\t123\n",
         auto_text.lines().any(|l| l.starts_with("TEST\tTEST\tG1\t")),
         "{auto_text}"
     );
+
+    // Streaming output is used by the dashboard for whole-genome scans.
+    let stream_out = dir.join("stream.tsv");
+    let stream_report = dir.join("stream-report.json");
+    let stream = Command::new(bin)
+        .args([
+            "scan",
+            "--genome",
+            genome_path.to_str().unwrap(),
+            "--gff",
+            gff_path.to_str().unwrap(),
+            "--motifs",
+            motif_path.to_str().unwrap(),
+            "--tf-map",
+            map_path.to_str().unwrap(),
+            "--promoter-len",
+            "100",
+            "--downstream",
+            "100",
+            "--pvalue",
+            "1e-3",
+            "--out",
+            stream_out.to_str().unwrap(),
+            "--report-json",
+            stream_report.to_str().unwrap(),
+            "--stream",
+            "--threads",
+            "2",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        stream.status.success(),
+        "stream stderr: {}",
+        String::from_utf8_lossy(&stream.stderr)
+    );
+    let stream_text = std::fs::read_to_string(&stream_out).unwrap();
+    assert!(stream_text.contains("prediction_motif"), "{stream_text}");
+    assert!(stream_text.lines().count() >= 3, "{stream_text}");
+    let stream_json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&stream_report).unwrap()).unwrap();
+    let summary = stream_json["diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["code"] == "SCAN_SUMMARY")
+        .expect("SCAN_SUMMARY");
+    assert_eq!(summary["context"]["motif_hits"], "2");
+    assert_eq!(summary["context"]["total_edges"], "2");
 
     let validate_report = dir.join("validate-report.json");
     let validate = Command::new(bin)

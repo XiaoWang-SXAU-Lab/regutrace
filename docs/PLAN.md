@@ -35,6 +35,7 @@
 - `--downstream`：TSS 下游长度，默认 0；PlantRegMap 使用 500 上游 + 100 下游
 - `--pvalue`：PWM hit 的 p 值阈值，默认 1e-4
 - `--background`：A,C,G,T 背景概率，默认 0.25,0.25,0.25,0.25
+- `--threads`：扫描线程数，默认 CPU 核数 − 1；`1` 为单线程
 - `--annotation`：可选，TSV `gene_id, symbol`
 - `--user-list`：可选，TSV `tf, target, evidence_type, evidence_level, method, source, pmid, condition, score, notes`
 - `--out`：输出 TSV
@@ -93,13 +94,21 @@ hit_start  hit_end  strand  score  p_value  notes
 
 - 已实现：`regutrace` CLI（scan/validate/import/export/stats；genome/GFF/JASPAR
   PFM/promoter 提取/PWM 扫描/用户 list 合并；`validate` 与 `--report-json`
-  输出结构化 diagnostics，见 `docs/DIAGNOSTICS.md`）。
+  输出结构化 diagnostics，见 `docs/DIAGNOSTICS.md`；`--progress-json` 实时进度；
+  `--stream` 增量写出证据表，适合全基因组多 motif 扫描；`SCAN_SUMMARY` 带
+  genes/promoters/motif_hits/total_edges 等 context）。
 - 测试：59 个 core 单元测试 + 1 个 binary 单元测试 + 1 个 synthetic CLI E2E 通过。
 - 真实数据冒烟：Ensembl Plants release 60（27,655 genes）+ JASPAR 2024 plant
   PFMs；HSFA1E motif `MA1758.2` 扫描前 200 个 1 kb promoters，得到 67 个
   prediction hits，耗时约 3.4 s（含 genome/GFF 解析）。
+- 苦荞 2,000 promoters × 805 JASPAR motifs：528,201 hits，单线程 59 s；
+  `--threads 7`（默认 CPU-1）**17.2 s，约 3.4×**，hits 完全一致，峰值 RSS
+  约 533 MB，77 MB evidence TSV（`--stream`）；dashboard 后端建索引耗时
+  约 0.4 s，堆内存约 34 MB（TF/target/motif offset + target bitset）。
+- 苦荞 37,415 promoters × 805 motifs 全基因组单线程实测：**9,335,300 hits，
+  1.3 GB evidence，约 19 分钟**；按 7 线程实测比例估算约 5.5 分钟。
 - 当前缺口：`tf-map` 可省略并按 motif name 自动填充，但 name→gene ID/家族映射
-  仍未做；未做 FDR、DAP/ChIP 边表和全基因组多 motif 性能优化。
+  仍未做；未做 FDR、DAP/ChIP 边表；全基因组多线程尚未单独跑完整验证。
 
 ## Benchmark（Biostrings 对照，2026-11-11）
 

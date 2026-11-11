@@ -1,6 +1,8 @@
 //! TSV input/output for TF–Target evidence records.
 
 use std::collections::HashMap;
+use std::fs::File;
+use std::io::BufWriter;
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
@@ -231,6 +233,76 @@ fn fmt_p(v: Option<f64>) -> String {
     v.map(|x| format!("{x:.6e}")).unwrap_or_default()
 }
 
+fn write_header<W: std::io::Write>(wtr: &mut csv::Writer<W>) -> Result<()> {
+    wtr.write_record([
+        "tf_id", "tf_symbol", "target_id", "target_symbol", "evidence_type", "evidence_level",
+        "method", "source", "pmid", "condition", "promoter_start", "promoter_end", "motif_id",
+        "hit_start", "hit_end", "strand", "score", "p_value", "notes",
+    ])?;
+    Ok(())
+}
+
+fn write_edge_record<W: std::io::Write>(
+    wtr: &mut csv::Writer<W>,
+    e: &EdgeRecord,
+) -> Result<()> {
+    let promoter_start = fmt_opt(e.promoter_start);
+    let promoter_end = fmt_opt(e.promoter_end);
+    let hit_start = fmt_opt(e.hit_start);
+    let hit_end = fmt_opt(e.hit_end);
+    let score = fmt_f64(e.score);
+    let p_value = fmt_p(e.p_value);
+    wtr.write_record([
+        e.tf_id.as_str(),
+        e.tf_symbol.as_str(),
+        e.target_id.as_str(),
+        e.target_symbol.as_str(),
+        e.evidence_type.as_str(),
+        e.evidence_level.as_str(),
+        e.method.as_str(),
+        e.source.as_str(),
+        e.pmid.as_str(),
+        e.condition.as_str(),
+        promoter_start.as_str(),
+        promoter_end.as_str(),
+        e.motif_id.as_str(),
+        hit_start.as_str(),
+        hit_end.as_str(),
+        e.strand.as_str(),
+        score.as_str(),
+        p_value.as_str(),
+        e.notes.as_str(),
+    ])?;
+    Ok(())
+}
+
+/// Incremental evidence writer used for whole-genome scans that can emit
+/// millions of rows. Rows are written in scan order rather than sorted, so the
+/// caller should only use this when streaming output matters.
+pub struct EdgeStream {
+    wtr: csv::Writer<BufWriter<File>>,
+}
+
+impl EdgeStream {
+    pub fn create(path: &Path) -> Result<Self> {
+        let file = File::create(path).with_context(|| format!("create {}", path.display()))?;
+        let mut wtr = WriterBuilder::new()
+            .delimiter(b'\t')
+            .from_writer(BufWriter::new(file));
+        write_header(&mut wtr)?;
+        Ok(Self { wtr })
+    }
+
+    pub fn write(&mut self, e: &EdgeRecord) -> Result<()> {
+        write_edge_record(&mut self.wtr, e)
+    }
+
+    pub fn flush(&mut self) -> Result<()> {
+        self.wtr.flush()?;
+        Ok(())
+    }
+}
+
 pub fn write_edges(path: &Path, edges: &mut Vec<EdgeRecord>) -> Result<()> {
     edges.sort_by(|a, b| {
         a.tf_id
@@ -246,39 +318,9 @@ pub fn write_edges(path: &Path, edges: &mut Vec<EdgeRecord>) -> Result<()> {
         .delimiter(b'\t')
         .from_path(path)
         .with_context(|| format!("create {}", path.display()))?;
-    wtr.write_record([
-        "tf_id", "tf_symbol", "target_id", "target_symbol", "evidence_type", "evidence_level",
-        "method", "source", "pmid", "condition", "promoter_start", "promoter_end", "motif_id",
-        "hit_start", "hit_end", "strand", "score", "p_value", "notes",
-    ])?;
+    write_header(&mut wtr)?;
     for e in edges {
-        let promoter_start = fmt_opt(e.promoter_start);
-        let promoter_end = fmt_opt(e.promoter_end);
-        let hit_start = fmt_opt(e.hit_start);
-        let hit_end = fmt_opt(e.hit_end);
-        let score = fmt_f64(e.score);
-        let p_value = fmt_p(e.p_value);
-        wtr.write_record([
-            e.tf_id.as_str(),
-            e.tf_symbol.as_str(),
-            e.target_id.as_str(),
-            e.target_symbol.as_str(),
-            e.evidence_type.as_str(),
-            e.evidence_level.as_str(),
-            e.method.as_str(),
-            e.source.as_str(),
-            e.pmid.as_str(),
-            e.condition.as_str(),
-            promoter_start.as_str(),
-            promoter_end.as_str(),
-            e.motif_id.as_str(),
-            hit_start.as_str(),
-            hit_end.as_str(),
-            e.strand.as_str(),
-            score.as_str(),
-            p_value.as_str(),
-            e.notes.as_str(),
-        ])?;
+        write_edge_record(&mut wtr, e)?;
     }
     wtr.flush()?;
     Ok(())
