@@ -239,6 +239,27 @@ AT1G00010\tG2\tpoint_validation_emsa\tA\tEMSA\tPMID:123\t123\n",
         String::from_utf8_lossy(&strict.stderr)
     );
 
+    let arg_report = dir.join("argfail.json");
+    let argfail = Command::new(bin)
+        .args([
+            "scan",
+            "--pvalue",
+            "2",
+            "--report-json",
+            arg_report.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!argfail.status.success());
+    let arg_json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&arg_report).unwrap()).unwrap();
+    assert_eq!(arg_json["command"], "scan");
+    assert!(arg_json["diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|d| d["code"] == "SCAN_FAILED"));
+
     let db_path = dir.join("evidence.db");
     let import = Command::new(bin)
         .args([

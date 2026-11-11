@@ -109,12 +109,14 @@ pub fn read_tf_map(path: &Path) -> Result<Vec<TfMotif>> {
     let symbol = find_col(&headers, &["tf_symbol", "symbol"]);
     let family = find_col(&headers, &["family", "tf_family"]);
     let mut out = Vec::new();
+    let mut row = 1usize;
     for rec in rdr.records() {
         let rec = rec?;
+        row += 1;
         let tf_id = cell(&rec, Some(tf));
         let motif_id = cell(&rec, Some(motif));
         if tf_id.is_empty() || motif_id.is_empty() {
-            continue;
+            bail!("tf-map row {row}: empty tf_id or motif_id");
         }
         out.push(TfMotif {
             tf_symbol: if symbol.is_some() {
@@ -385,6 +387,23 @@ mod tests {
         assert_eq!(u[0].evidence_level, "A");
         let _ = std::fs::remove_file(map);
         let _ = std::fs::remove_file(user);
+    }
+
+    #[test]
+    fn rejects_missing_tf_map_ids() {
+        let path = std::env::temp_dir().join(format!(
+            "regutrace_tfmap_missing_{}.tsv",
+            std::process::id()
+        ));
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            writeln!(f, "tf_id\tmotif_id").unwrap();
+            writeln!(f, "\tMA0001.1").unwrap();
+        }
+        let err = read_tf_map(&path).unwrap_err().to_string();
+        assert!(err.contains("row 2"), "{err}");
+        assert!(err.contains("empty tf_id or motif_id"), "{err}");
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

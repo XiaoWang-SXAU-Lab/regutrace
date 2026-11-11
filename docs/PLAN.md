@@ -94,7 +94,7 @@ hit_start  hit_end  strand  score  p_value  notes
 - 已实现：`regutrace` CLI（scan/validate/import/export/stats；genome/GFF/JASPAR
   PFM/promoter 提取/PWM 扫描/用户 list 合并；`validate` 与 `--report-json`
   输出结构化 diagnostics，见 `docs/DIAGNOSTICS.md`）。
-- 测试：50 个 core 单元测试 + 1 个 binary 单元测试 + 1 个 synthetic CLI E2E 通过。
+- 测试：55 个 core 单元测试 + 1 个 binary 单元测试 + 1 个 synthetic CLI E2E 通过。
 - 真实数据冒烟：Ensembl Plants release 60（27,655 genes）+ JASPAR 2024 plant
   PFMs；HSFA1E motif `MA1758.2` 扫描前 200 个 1 kb promoters，得到 67 个
   prediction hits，耗时约 3.4 s（含 genome/GFF 解析）。

@@ -239,8 +239,48 @@ fn write_promoters_fasta(path: &std::path::Path, promoters: &[promoter::Promoter
     Ok(())
 }
 
+fn report_path_from_args(raw: &[String]) -> Option<PathBuf> {
+    let mut it = raw.iter();
+    while let Some(arg) = it.next() {
+        if arg == "--report-json" {
+            return it.next().map(PathBuf::from);
+        }
+    }
+    None
+}
+
+fn write_argument_error_report(
+    command: &str,
+    path: &Option<PathBuf>,
+    err: &anyhow::Error,
+) -> Result<()> {
+    let mut report = diagnostics::Report::new(command);
+    report.push(diagnostics::Diagnostic::error(
+        if command == "scan" {
+            "SCAN_FAILED"
+        } else {
+            "VALIDATE_FAILED"
+        },
+        format!("{err:#}"),
+    ));
+    for line in report.human_lines() {
+        eprintln!("{line}");
+    }
+    if let Some(path) = path {
+        report.write_json(path)?;
+    }
+    Ok(())
+}
+
 fn cmd_validate(raw: &[String]) -> Result<()> {
-    let args = parse_scan_args(raw)?;
+    let report_path = report_path_from_args(raw);
+    let args = match parse_scan_args(raw) {
+        Ok(args) => args,
+        Err(e) => {
+            write_argument_error_report("validate", &report_path, &e)?;
+            return Err(e);
+        }
+    };
     let mut report = diagnostics::Report::new("validate");
     let result = run_validate(&args, &mut report);
     if let Err(e) = &result {
@@ -402,7 +442,14 @@ fn run_validate(args: &Args, report: &mut diagnostics::Report) -> Result<()> {
 }
 
 fn cmd_scan(raw: &[String]) -> Result<()> {
-    let args = parse_scan_args(raw)?;
+    let report_path = report_path_from_args(raw);
+    let args = match parse_scan_args(raw) {
+        Ok(args) => args,
+        Err(e) => {
+            write_argument_error_report("scan", &report_path, &e)?;
+            return Err(e);
+        }
+    };
     let mut report = diagnostics::Report::new("scan");
     let result = run_scan(&args, &mut report);
     if let Err(e) = &result {

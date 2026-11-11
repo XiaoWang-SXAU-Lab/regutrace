@@ -73,12 +73,14 @@ impl Fasta {
         if let Some(s) = self.seqs.get(chrom) {
             return Some(s);
         }
-        if let Some((_, s)) = self
+        let mut case_matches: Vec<&String> = self
             .seqs
-            .iter()
-            .find(|(name, _)| name.eq_ignore_ascii_case(chrom))
-        {
-            return Some(s);
+            .keys()
+            .filter(|name| name.eq_ignore_ascii_case(chrom))
+            .collect();
+        if !case_matches.is_empty() {
+            case_matches.sort();
+            return self.seqs.get(case_matches[0]);
         }
         let (query_family, query_core) = split_chrom(chrom);
         let mut keys: Vec<&String> = self.seqs.keys().collect();
@@ -194,6 +196,21 @@ mod tests {
         assert_eq!(fa.seq("1").unwrap().as_slice(), b"AAA");
         assert_eq!(fa.seq("scaffold1").unwrap().as_slice(), b"CCC");
         assert!(fa.seq("contig1").is_none());
+    }
+
+    #[test]
+    fn case_aliases_are_deterministic() {
+        let mut seqs = HashMap::new();
+        seqs.insert("chr1".to_string(), b"lower".to_vec());
+        seqs.insert("CHR1".to_string(), b"upper".to_vec());
+        let fa = Fasta {
+            seqs,
+            order: vec![],
+        };
+        for _ in 0..20 {
+            // Both keys match case-insensitively; sorted selection is stable.
+            assert_eq!(fa.seq("Chr1").unwrap().as_slice(), b"upper");
+        }
     }
 
     #[test]

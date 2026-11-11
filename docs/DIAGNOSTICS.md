@@ -71,6 +71,7 @@ are warnings, emitting `STRICT_WARNINGS`.
 | `GFF_SUMMARY` | info | gene/transcript counts and feature-type histogram |
 | `GFF_NO_GENES` | error | no usable gene/transcript models |
 | `GFF_INFERRED_MODELS` | info | genes/transcripts inferred from CDS/exon records |
+| `GFF_SKIPPED_RECORDS` | warning | feature records lacked a required ID/Parent and were skipped |
 | `GFF_GENES_WITHOUT_TRANSCRIPT` | warning | gene has no mRNA/transcript; TSS uses gene bounds |
 | `GFF_TRANSCRIPTS_WITHOUT_FEATURES` | warning | no CDS/exon/UTR; length falls back to genomic span |
 | `GFF_MULTI_ISOFORM` | info | multiple isoforms; one representative transcript is selected |
