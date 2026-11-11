@@ -1,3 +1,11 @@
 [workspace]
 members = ["crates/regutrace-core", "crates/regutrace-cli"]
 resolver = "3"
+
+# Smaller, symbol-free release binaries are easier to inspect and less likely to
+# trip heuristic endpoint protection. Debug/test profiles are unchanged.
+[profile.release]
+strip = "symbols"
+lto = "thin"
+codegen-units = 1
+panic = "abort"

@@ -64,6 +64,21 @@ regutrace stats  --db reguledger.db
 regutrace export --db reguledger.db --out evidence_export.tsv
 ```
 
+Export the full hit table to SQLite, CSV/TSV, gzip or JSONL:
+
+```bash
+regutrace convert --input evidence.tsv --out evidence.db --format sqlite
+regutrace convert --input evidence.tsv --out evidence.csv.gz --format csv --gzip true
+regutrace convert --input evidence.tsv --out evidence.jsonl.gz --format jsonl --gzip
+```
+
+Validate a canonical prior database and query upstream TFs for a module gene list:
+
+```bash
+regutrace validate-db --db evidence.db
+regutrace prior --db evidence.db --targets module_genes.txt --out upstream.tsv
+```
+
 `--tf-map` is optional. When it is omitted, `tf_id`/`tf_symbol` are taken from
 the motif header name (for example JASPAR `>MA1758.2 HSFA1E`); provide a tf-map
 when you need gene IDs or family annotations.

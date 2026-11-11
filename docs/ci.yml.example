@@ -7,8 +7,13 @@ on:
 jobs:
   test:
     runs-on: windows-latest
+    env:
+      RUSTFLAGS: '-C link-self-contained=yes'
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust GNU toolchain
+        run: rustup toolchain install stable-x86_64-pc-windows-gnu --profile minimal
+      - name: Install MinGW
+        run: choco install mingw -y
       - name: Test workspace
-        run: cargo test --workspace
+        run: cargo +stable-x86_64-pc-windows-gnu test --release --locked --workspace

@@ -231,8 +231,11 @@ name = "regutrace-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "csv",
+ "flate2",
  "rayon",
  "regutrace-core",
+ "rusqlite",
  "serde_json",
 ]
 
