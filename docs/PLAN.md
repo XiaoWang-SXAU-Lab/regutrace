@@ -54,8 +54,9 @@ hit_start  hit_end  strand  score  p_value  notes
 
 ## 处理流程
 
-1. 读 genome FASTA、GFF3；按 transcript 选代表 TSS（每个 gene 取最长 transcript，
-   缺失时退回 gene 坐标）。
+1. 读 genome FASTA、GFF3；每个 gene 选一条代表转录本：优先 exon 长度和，其次
+   CDS+UTR 长度和，最后基因组跨度；并列时取最上游 TSS；无 transcript 时退回
+   gene 坐标。
 2. 提取 promoter：默认取 TSS 上游 `--promoter-len`；可加 `--downstream` 纳入 TSS
    下游。`+` 链取上游；`-` 链取下游，并反向互补，使 promoter 始终按基因转录方向
    5'→3'。

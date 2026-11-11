@@ -105,6 +105,13 @@ scripts/                 data-pack fetch + benchmark
 docs/                    plan, evidence schema, benchmark, API plan
 ```
 
+## Representative transcript
+
+Each gene uses one representative transcript: the longest spliced transcript
+(sum of exon lengths; CDS + UTR lengths when exon features are absent; genomic
+span as a last resort). Ties prefer the most upstream TSS; a gene without any
+transcript feature falls back to its gene coordinates.
+
 ## Limitations
 
 - PWM prediction has high false-positive rates; many plant TF families share

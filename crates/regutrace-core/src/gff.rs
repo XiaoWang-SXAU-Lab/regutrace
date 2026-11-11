@@ -66,10 +66,35 @@ fn clean_id(value: &str) -> String {
     v.to_string()
 }
 
+/// Representative-transcript length: exon sum when exons are present, else
+/// CDS + UTR sum (spliced length), else the genomic span.
+fn transcript_metric(
+    tx: &TxInfo,
+    exon_len: &HashMap<String, u64>,
+    cds_len: &HashMap<String, u64>,
+    utr_len: &HashMap<String, u64>,
+) -> u64 {
+    if let Some(&n) = exon_len.get(&tx.transcript_id) {
+        if n > 0 {
+            return n;
+        }
+    }
+    let cds = cds_len.get(&tx.transcript_id).copied().unwrap_or(0);
+    let utr = utr_len.get(&tx.transcript_id).copied().unwrap_or(0);
+    if cds + utr > 0 {
+        cds + utr
+    } else {
+        tx.end.saturating_sub(tx.start) + 1
+    }
+}
+
 pub fn read_gff(path: &Path) -> Result<Vec<GeneModel>> {
     let reader = BufReader::new(open_reader(path)?);
     let mut genes: HashMap<String, GeneInfo> = HashMap::new();
     let mut tx: HashMap<String, Vec<TxInfo>> = HashMap::new();
+    let mut exon_len: HashMap<String, u64> = HashMap::new();
+    let mut cds_len: HashMap<String, u64> = HashMap::new();
+    let mut utr_len: HashMap<String, u64> = HashMap::new();
 
     for (lineno, line) in reader.lines().enumerate() {
         let line = line.with_context(|| format!("read GFF line {}", lineno + 1))?;
@@ -143,6 +168,22 @@ pub fn read_gff(path: &Path) -> Result<Vec<GeneModel>> {
                     strand,
                 });
             }
+        } else if matches!(kind, "exon" | "CDS" | "five_prime_UTR" | "three_prime_UTR") {
+            let Some(parent_raw) = attr(attrs, "Parent") else {
+                continue;
+            };
+            let len = end - start + 1;
+            for parent_raw in parent_raw.split(',') {
+                let transcript_id = clean_id(parent_raw);
+                if transcript_id.is_empty() {
+                    continue;
+                }
+                match kind {
+                    "exon" => *exon_len.entry(transcript_id).or_insert(0) += len,
+                    "CDS" => *cds_len.entry(transcript_id).or_insert(0) += len,
+                    _ => *utr_len.entry(transcript_id).or_insert(0) += len,
+                }
+            }
         }
     }
 
@@ -167,14 +208,27 @@ pub fn read_gff(path: &Path) -> Result<Vec<GeneModel>> {
 
     let mut out = Vec::with_capacity(genes.len());
     for (gene_id, info) in genes {
-        let best = tx
-            .get(&gene_id)
-            .and_then(|v| v.iter().max_by_key(|t| t.end.saturating_sub(t.start)));
         let strand = if info.strand == '+' || info.strand == '-' {
             info.strand
         } else {
-            best.map(|t| t.strand).unwrap_or('+')
+            tx.get(&gene_id)
+                .and_then(|v| v.first())
+                .map(|t| t.strand)
+                .unwrap_or('+')
         };
+        let best = tx.get(&gene_id).and_then(|v| {
+            v.iter().max_by_key(|t| {
+                let metric = transcript_metric(t, &exon_len, &cds_len, &utr_len);
+                // Ties prefer the most upstream TSS: smallest start on '+',
+                // largest end on '-'.
+                let tie = if strand == '-' {
+                    t.end
+                } else {
+                    u64::MAX.saturating_sub(t.start)
+                };
+                (metric, tie)
+            })
+        });
         let (transcript_id, tss) = match best {
             Some(t) => (
                 Some(t.transcript_id.clone()),
@@ -272,6 +326,86 @@ mod tests {
             assert_eq!(g.transcript_id.as_deref(), Some("tx1"));
         }
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn selects_longest_spliced_transcript() {
+        let path = std::env::temp_dir().join(format!(
+            "regutrace_gff_isoform_{}.gff3",
+            std::process::id()
+        ));
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            writeln!(f, "Chr1\ttest\tgene\t100\t500\t.\t+\t.\tID=G1").unwrap();
+            writeln!(f, "Chr1\ttest\tmRNA\t100\t500\t.\t+\t.\tID=tx1;Parent=G1").unwrap();
+            writeln!(f, "Chr1\ttest\tmRNA\t150\t300\t.\t+\t.\tID=tx2;Parent=G1").unwrap();
+            writeln!(f, "Chr1\ttest\tCDS\t100\t200\t.\t+\t0\tParent=tx1").unwrap();
+            writeln!(f, "Chr1\ttest\tCDS\t150\t300\t.\t+\t0\tParent=tx2").unwrap();
+        }
+        let genes = read_gff(&path).unwrap();
+        let g = genes.iter().find(|g| g.gene_id == "G1").unwrap();
+        assert_eq!(g.transcript_id.as_deref(), Some("tx2"));
+        assert_eq!(g.tss, 150);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn selects_longest_exon_transcript_on_minus() {
+        let path = std::env::temp_dir().join(format!(
+            "regutrace_gff_isoform_minus_{}.gff3",
+            std::process::id()
+        ));
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            writeln!(f, "Chr1\ttest\tgene\t100\t500\t.\t-\t.\tID=G2").unwrap();
+            writeln!(f, "Chr1\ttest\tmRNA\t100\t500\t.\t-\t.\tID=tx1;Parent=G2").unwrap();
+            writeln!(f, "Chr1\ttest\tmRNA\t100\t300\t.\t-\t.\tID=tx2;Parent=G2").unwrap();
+            writeln!(f, "Chr1\ttest\texon\t100\t150\t.\t-\t.\tParent=tx1").unwrap();
+            writeln!(f, "Chr1\ttest\texon\t400\t500\t.\t-\t.\tParent=tx1").unwrap();
+            writeln!(f, "Chr1\ttest\texon\t100\t300\t.\t-\t.\tParent=tx2").unwrap();
+        }
+        let genes = read_gff(&path).unwrap();
+        let g = genes.iter().find(|g| g.gene_id == "G2").unwrap();
+        assert_eq!(g.transcript_id.as_deref(), Some("tx2"));
+        assert_eq!(g.tss, 300);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn uses_cds_and_utr_when_exons_are_absent() {
+        let path = std::env::temp_dir().join(format!(
+            "regutrace_gff_isoform_utr_{}.gff3",
+            std::process::id()
+        ));
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            writeln!(f, "Chr1\ttest\tgene\t100\t500\t.\t+\t.\tID=G3").unwrap();
+            writeln!(f, "Chr1\ttest\tmRNA\t100\t500\t.\t+\t.\tID=tx1;Parent=G3").unwrap();
+            writeln!(f, "Chr1\ttest\tmRNA\t150\t300\t.\t+\t.\tID=tx2;Parent=G3").unwrap();
+            writeln!(f, "Chr1\ttest\tCDS\t100\t200\t.\t+\t0\tParent=tx1").unwrap();
+            writeln!(f, "Chr1\ttest\tCDS\t150\t250\t.\t+\t0\tParent=tx2").unwrap();
+            writeln!(f, "Chr1\ttest\tfive_prime_UTR\t251\t300\t.\t+\t.\tParent=tx2").unwrap();
+        }
+        let genes = read_gff(&path).unwrap();
+        let g = genes.iter().find(|g| g.gene_id == "G3").unwrap();
+        assert_eq!(g.transcript_id.as_deref(), Some("tx2"));
+        assert_eq!(g.tss, 150);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn transcript_metric_falls_back_to_span() {
+        let tx = TxInfo {
+            transcript_id: "t1".into(),
+            start: 100,
+            end: 300,
+            chrom: "Chr1".into(),
+            strand: '+',
+        };
+        assert_eq!(
+            transcript_metric(&tx, &HashMap::new(), &HashMap::new(), &HashMap::new()),
+            201
+        );
     }
 
     #[test]
