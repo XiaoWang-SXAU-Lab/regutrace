@@ -59,6 +59,42 @@ fn cell(rec: &csv::StringRecord, idx: Option<usize>) -> String {
         .unwrap_or_default()
 }
 
+fn parse_level(raw: &str, context: &str) -> Result<String> {
+    let level = raw.trim().to_ascii_uppercase();
+    if level.is_empty() {
+        bail!("{context}: missing evidence_level (A/B/C/D/E)");
+    }
+    if !matches!(level.as_str(), "A" | "B" | "C" | "D" | "E") {
+        bail!("{context}: invalid evidence_level '{raw}' (expected A/B/C/D/E)");
+    }
+    Ok(level)
+}
+
+fn parse_u64_field(raw: String) -> Result<Option<u64>> {
+    let t = raw.trim();
+    if t.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(
+        t.parse::<u64>()
+            .with_context(|| format!("invalid integer '{t}'"))?,
+    ))
+}
+
+fn parse_f64_field(raw: String) -> Result<Option<f64>> {
+    let t = raw.trim();
+    if t.is_empty() {
+        return Ok(None);
+    }
+    let v = t
+        .parse::<f64>()
+        .with_context(|| format!("invalid number '{t}'"))?;
+    if !v.is_finite() {
+        bail!("non-finite number '{t}'");
+    }
+    Ok(Some(v))
+}
+
 pub fn read_tf_map(path: &Path) -> Result<Vec<TfMotif>> {
     let reader = open_reader(path)?;
     let mut rdr = ReaderBuilder::new()
@@ -145,22 +181,25 @@ pub fn read_user_list(path: &Path) -> Result<Vec<EdgeRecord>> {
     let notes = find_col(&headers, &["notes", "note"]);
 
     let mut out = Vec::new();
+    let mut row = 1usize;
     for rec in rdr.records() {
         let rec = rec?;
+        row += 1;
         let tf_id = cell(&rec, Some(tf));
         let target_id = cell(&rec, Some(target));
         if tf_id.is_empty() || target_id.is_empty() {
-            continue;
+            bail!("user list row {row}: empty tf or target");
         }
         let ev_type = {
             let v = cell(&rec, evidence_type);
             if v.is_empty() { "user_curated".to_string() } else { v }
         };
-        let ev_level = {
-            let v = cell(&rec, evidence_level);
-            if v.is_empty() { "user_curated".to_string() } else { v }
-        };
-        let score_v = cell(&rec, score).parse::<f64>().ok();
+        let ev_level = parse_level(
+            &cell(&rec, evidence_level),
+            &format!("user list row {row}"),
+        )?;
+        let score_v = parse_f64_field(cell(&rec, score))
+            .with_context(|| format!("user list row {row}"))?;
         out.push(EdgeRecord {
             tf_symbol: cell(&rec, tf_symbol),
             target_symbol: cell(&rec, target_symbol),
@@ -185,6 +224,9 @@ fn fmt_opt<T: std::fmt::Display>(v: Option<T>) -> String {
 }
 fn fmt_f64(v: Option<f64>) -> String {
     v.map(|x| format!("{x:.6}")).unwrap_or_default()
+}
+fn fmt_p(v: Option<f64>) -> String {
+    v.map(|x| format!("{x:.6e}")).unwrap_or_default()
 }
 
 pub fn write_edges(path: &Path, edges: &mut Vec<EdgeRecord>) -> Result<()> {
@@ -213,7 +255,7 @@ pub fn write_edges(path: &Path, edges: &mut Vec<EdgeRecord>) -> Result<()> {
         let hit_start = fmt_opt(e.hit_start);
         let hit_end = fmt_opt(e.hit_end);
         let score = fmt_f64(e.score);
-        let p_value = fmt_f64(e.p_value);
+        let p_value = fmt_p(e.p_value);
         wtr.write_record([
             e.tf_id.as_str(),
             e.tf_symbol.as_str(),
@@ -269,25 +311,26 @@ pub fn read_edges(path: &Path) -> Result<Vec<EdgeRecord>> {
     let p_value = find_col(&headers, &["p_value", "pvalue"]);
     let notes = find_col(&headers, &["notes", "note"]);
 
-    let parse_u64 = |s: String| s.trim().parse::<u64>().ok();
-    let parse_f64 = |s: String| s.trim().parse::<f64>().ok();
-
     let mut out = Vec::new();
+    let mut row = 1usize;
     for rec in rdr.records() {
         let rec = rec?;
+        row += 1;
+        let ctx = || format!("evidence TSV row {row}");
         let tf_id = cell(&rec, Some(tf));
         let target_id = cell(&rec, Some(target));
         if tf_id.is_empty() || target_id.is_empty() {
-            continue;
+            bail!("{}: empty tf_id or target_id", ctx());
         }
         let ev_type = {
             let v = cell(&rec, evidence_type);
-            if v.is_empty() { "prediction_motif".to_string() } else { v }
+            if v.is_empty() {
+                bail!("{}: missing evidence_type", ctx());
+            } else {
+                v
+            }
         };
-        let ev_level = {
-            let v = cell(&rec, evidence_level);
-            if v.is_empty() { "D".to_string() } else { v }
-        };
+        let ev_level = parse_level(&cell(&rec, evidence_level), &ctx())?;
         out.push(EdgeRecord {
             tf_id,
             tf_symbol: cell(&rec, tf_symbol),
@@ -299,14 +342,15 @@ pub fn read_edges(path: &Path) -> Result<Vec<EdgeRecord>> {
             source: cell(&rec, source),
             pmid: cell(&rec, pmid),
             condition: cell(&rec, condition),
-            promoter_start: parse_u64(cell(&rec, promoter_start)),
-            promoter_end: parse_u64(cell(&rec, promoter_end)),
+            promoter_start: parse_u64_field(cell(&rec, promoter_start))
+                .with_context(ctx)?,
+            promoter_end: parse_u64_field(cell(&rec, promoter_end)).with_context(ctx)?,
             motif_id: cell(&rec, motif_id),
-            hit_start: parse_u64(cell(&rec, hit_start)),
-            hit_end: parse_u64(cell(&rec, hit_end)),
+            hit_start: parse_u64_field(cell(&rec, hit_start)).with_context(ctx)?,
+            hit_end: parse_u64_field(cell(&rec, hit_end)).with_context(ctx)?,
             strand: cell(&rec, strand),
-            score: parse_f64(cell(&rec, score)),
-            p_value: parse_f64(cell(&rec, p_value)),
+            score: parse_f64_field(cell(&rec, score)).with_context(ctx)?,
+            p_value: parse_f64_field(cell(&rec, p_value)).with_context(ctx)?,
             notes: cell(&rec, notes),
         });
     }
@@ -340,6 +384,177 @@ mod tests {
         assert_eq!(u.len(), 1);
         assert_eq!(u[0].evidence_level, "A");
         let _ = std::fs::remove_file(map);
+        let _ = std::fs::remove_file(user);
+    }
+
+    #[test]
+    fn rejects_invalid_user_evidence_level() {
+        let user = std::env::temp_dir().join(format!(
+            "regutrace_badlevel_{}.tsv",
+            std::process::id()
+        ));
+        {
+            let mut f = std::fs::File::create(&user).unwrap();
+            writeln!(f, "tf\ttarget\tevidence_level").unwrap();
+            writeln!(f, "AT1G00010\tAT2G00020\tuser_curated").unwrap();
+        }
+        let err = read_user_list(&user).unwrap_err().to_string();
+        assert!(err.contains("invalid evidence_level"), "{err}");
+        let _ = std::fs::remove_file(user);
+    }
+
+    #[test]
+    fn rejects_missing_user_evidence_level() {
+        let user = std::env::temp_dir().join(format!(
+            "regutrace_misslevel_{}.tsv",
+            std::process::id()
+        ));
+        {
+            let mut f = std::fs::File::create(&user).unwrap();
+            writeln!(f, "tf\ttarget").unwrap();
+            writeln!(f, "AT1G00010\tAT2G00020").unwrap();
+        }
+        let err = read_user_list(&user).unwrap_err().to_string();
+        assert!(err.contains("missing evidence_level"), "{err}");
+        let _ = std::fs::remove_file(user);
+    }
+
+    #[test]
+    fn rejects_missing_level_in_evidence_tsv() {
+        let path = std::env::temp_dir().join(format!(
+            "regutrace_evidence_nolevel_{}.tsv",
+            std::process::id()
+        ));
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            writeln!(f, "tf_id\ttarget_id\tevidence_type").unwrap();
+            writeln!(f, "TF1\tG1\tprediction_motif").unwrap();
+        }
+        let err = read_edges(&path).unwrap_err().to_string();
+        assert!(err.contains("missing evidence_level"), "{err}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn rejects_missing_evidence_target() {
+        let path = std::env::temp_dir().join(format!(
+            "regutrace_evidence_notarget_{}.tsv",
+            std::process::id()
+        ));
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            writeln!(f, "tf_id\ttarget_id\tevidence_type\tevidence_level").unwrap();
+            writeln!(f, "TF\t\tcurated\tA").unwrap();
+        }
+        let err = read_edges(&path).unwrap_err().to_string();
+        assert!(err.contains("empty tf_id or target_id"), "{err}");
+        assert!(err.contains("row 2"), "{err}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn rejects_missing_user_target() {
+        let path = std::env::temp_dir().join(format!(
+            "regutrace_user_notarget_{}.tsv",
+            std::process::id()
+        ));
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            writeln!(f, "tf\ttarget\tevidence_level").unwrap();
+            writeln!(f, "TF\t\tA").unwrap();
+        }
+        let err = read_user_list(&path).unwrap_err().to_string();
+        assert!(err.contains("empty tf or target"), "{err}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn rejects_missing_evidence_type() {
+        let path = std::env::temp_dir().join(format!(
+            "regutrace_evidence_notype_{}.tsv",
+            std::process::id()
+        ));
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            writeln!(f, "tf_id\ttarget_id\tevidence_level").unwrap();
+            writeln!(f, "TF1\tG1\tD").unwrap();
+        }
+        let err = read_edges(&path).unwrap_err().to_string();
+        assert!(err.contains("missing evidence_type"), "{err}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn rejects_invalid_evidence_coordinates() {
+        let path = std::env::temp_dir().join(format!(
+            "regutrace_evidence_badcoord_{}.tsv",
+            std::process::id()
+        ));
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            writeln!(
+                f,
+                "tf_id\ttarget_id\tevidence_type\tevidence_level\tpromoter_start"
+            )
+            .unwrap();
+            writeln!(f, "TF1\tG1\tprediction_motif\tD\tabc").unwrap();
+        }
+        let err = format!("{:#}", read_edges(&path).unwrap_err());
+        assert!(err.contains("invalid integer"), "{err}");
+        assert!(err.contains("row 2"), "{err}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn rejects_invalid_user_score() {
+        let path = std::env::temp_dir().join(format!(
+            "regutrace_user_badscore_{}.tsv",
+            std::process::id()
+        ));
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            writeln!(f, "tf\ttarget\tevidence_level\tscore").unwrap();
+            writeln!(f, "TF1\tG1\tA\tabc").unwrap();
+        }
+        let err = format!("{:#}", read_user_list(&path).unwrap_err());
+        assert!(err.contains("invalid number"), "{err}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn round_trips_tiny_p_value() {
+        let path = std::env::temp_dir().join(format!(
+            "regutrace_pvalue_{}.tsv",
+            std::process::id()
+        ));
+        let mut edges = vec![EdgeRecord {
+            tf_id: "TF1".into(),
+            target_id: "G1".into(),
+            evidence_type: "prediction_motif".into(),
+            evidence_level: "D".into(),
+            p_value: Some(1.23e-9),
+            ..Default::default()
+        }];
+        write_edges(&path, &mut edges).unwrap();
+        let back = read_edges(&path).unwrap();
+        let p = back[0].p_value.unwrap();
+        assert!((p - 1.23e-9).abs() < 1e-15, "p={p}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn normalizes_lowercase_user_evidence_level() {
+        let user = std::env::temp_dir().join(format!(
+            "regutrace_lowerlevel_{}.tsv",
+            std::process::id()
+        ));
+        {
+            let mut f = std::fs::File::create(&user).unwrap();
+            writeln!(f, "tf\ttarget\tevidence_level").unwrap();
+            writeln!(f, "AT1G00010\tAT2G00020\ta").unwrap();
+        }
+        let u = read_user_list(&user).unwrap();
+        assert_eq!(u[0].evidence_level, "A");
         let _ = std::fs::remove_file(user);
     }
 }

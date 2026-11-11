@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
@@ -14,13 +14,17 @@ pub struct Fasta {
 }
 
 pub fn open_reader(path: &Path) -> Result<Box<dyn Read>> {
-    let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
-    let gz = path
+    let mut file = File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let mut magic = [0u8; 2];
+    let n = file.read(&mut magic)?;
+    file.seek(SeekFrom::Start(0))?;
+    let gz_by_magic = n == 2 && magic == [0x1f, 0x8b];
+    let gz_by_extension = path
         .extension()
         .and_then(|s| s.to_str())
         .map(|s| s.eq_ignore_ascii_case("gz"))
         .unwrap_or(false);
-    if gz {
+    if gz_by_magic || gz_by_extension {
         Ok(Box::new(MultiGzDecoder::new(file)))
     } else {
         Ok(Box::new(file))
@@ -28,21 +32,27 @@ pub fn open_reader(path: &Path) -> Result<Box<dyn Read>> {
 }
 
 impl Fasta {
-    /// Resolve common plant chromosome naming differences (`1` vs `Chr1`).
+    /// Resolve common plant chromosome naming differences (`1`, `Chr1`,
+    /// `chr1`, `CHR1`).
     pub fn seq(&self, chrom: &str) -> Option<&Vec<u8>> {
         if let Some(s) = self.seqs.get(chrom) {
             return Some(s);
         }
-        let candidates = [
-            format!("Chr{chrom}"),
-            format!("chr{chrom}"),
-            chrom.trim_start_matches("Chr").to_string(),
-            chrom.trim_start_matches("chr").to_string(),
-            format!("Chr{}", chrom.trim_start_matches("Chr")),
-        ];
-        for c in candidates {
-            if let Some(s) = self.seqs.get(&c) {
-                return Some(s);
+        let core = chrom
+            .strip_prefix("Chr")
+            .or_else(|| chrom.strip_prefix("chr"))
+            .or_else(|| chrom.strip_prefix("CHR"))
+            .unwrap_or(chrom);
+        for c in [
+            format!("Chr{core}"),
+            format!("chr{core}"),
+            format!("CHR{core}"),
+            core.to_string(),
+        ] {
+            if c != chrom {
+                if let Some(s) = self.seqs.get(&c) {
+                    return Some(s);
+                }
             }
         }
         None
@@ -123,6 +133,27 @@ mod tests {
         let fa = read_fasta(&path).unwrap();
         assert_eq!(fa.seq("Chr1").unwrap().as_slice(), b"ACGTACGT");
         assert_eq!(fa.seq("1").unwrap().as_slice(), b"ACGTACGT");
+        assert_eq!(fa.seq("chr1").unwrap().as_slice(), b"ACGTACGT");
+        assert_eq!(fa.seq("CHR1").unwrap().as_slice(), b"ACGTACGT");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn reads_gzip_without_gz_extension() {
+        use flate2::Compression;
+        use flate2::write::GzEncoder;
+        let path = std::env::temp_dir().join(format!(
+            "regutrace_fasta_gz_{}.fa",
+            std::process::id()
+        ));
+        {
+            let f = File::create(&path).unwrap();
+            let mut enc = GzEncoder::new(f, Compression::default());
+            enc.write_all(b">Chr1\nACGT\n").unwrap();
+            enc.finish().unwrap();
+        }
+        let fa = read_fasta(&path).unwrap();
+        assert_eq!(fa.seq("Chr1").unwrap().as_slice(), b"ACGT");
         let _ = std::fs::remove_file(path);
     }
 }

@@ -31,6 +31,7 @@
 - `--motifs`：JASPAR PFM 文本（多记录）
 - `--tf-map`：TSV，列 `tf_id, tf_symbol, family, motif_id`
 - `--promoter-len`：上游长度，默认 1000 bp
+- `--downstream`：TSS 下游长度，默认 0；PlantRegMap 使用 500 上游 + 100 下游
 - `--pvalue`：PWM hit 的 p 值阈值，默认 1e-4
 - `--background`：A,C,G,T 背景概率，默认 0.25,0.25,0.25,0.25
 - `--annotation`：可选，TSV `gene_id, symbol`
@@ -47,15 +48,16 @@ hit_start  hit_end  strand  score  p_value  notes
 
 - 预测记录：`evidence_type=prediction_motif`, `evidence_level=D`,
   `method=jaspar_pwm`, `source=promoter_scan`。
-- 用户 list：`evidence_type=user_curated`（或用户指定），`evidence_level` 由用户指定，
-  缺失时默认 `user_curated`；预测字段留空。
+- 用户 list：`evidence_type=user_curated`（或用户指定）；`evidence_level` 必须显式
+  给出且只能是 A/B/C/D/E，缺失或非法值会拒绝导入；预测字段留空。
 
 ## 处理流程
 
 1. 读 genome FASTA、GFF3；按 transcript 选代表 TSS（每个 gene 取最长 transcript，
    缺失时退回 gene 坐标）。
-2. 提取 promoter：`+` 链取 TSS 上游；`-` 链取 TSS 下游，并反向互补，使 promoter
-   始终按基因转录方向 5'→3'。
+2. 提取 promoter：默认取 TSS 上游 `--promoter-len`；可加 `--downstream` 纳入 TSS
+   下游。`+` 链取上游；`-` 链取下游，并反向互补，使 promoter 始终按基因转录方向
+   5'→3'。
 3. 读 JASPAR PFM，转 log-odds；背景概率可配置。
 4. 对每个 motif 构建 score 的 null 分布（DP，按 0.1 精度离散化），得到每个 hit 的
    p 值；扫描 promoter 双链。
@@ -89,7 +91,7 @@ hit_start  hit_end  strand  score  p_value  notes
 
 - 已实现：`regutrace` CLI（genome/GFF/JASPAR PFM/promoter 提取/PWM 扫描/
   用户 TF–target list 合并）。
-- 测试：50 个库单元测试 + 1 个 synthetic CLI E2E 测试通过。
+- 测试：9 个 core 单元测试 + 1 个 synthetic CLI E2E 测试通过。
 - 真实数据冒烟：Ensembl Plants release 60（27,655 genes）+ JASPAR 2024 plant
   PFMs；HSFA1E motif `MA1758.2` 扫描前 200 个 1 kb promoters，得到 67 个
   prediction hits，耗时约 3.4 s（含 genome/GFF 解析）。

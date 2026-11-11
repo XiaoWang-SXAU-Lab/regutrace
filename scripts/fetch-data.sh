@@ -48,7 +48,7 @@ Motifs: JASPAR 2024 CORE plants (CC BY 4.0; cite JASPAR)
 SHA256: $DEST/SHA256SUMS
 
 Example (promoter 1 kb, HSF motifs):
-  regutrace --genome "$DEST/Arabidopsis_thaliana.TAIR10.dna.toplevel.fa.gz" \\
+  regutrace scan --genome "$DEST/Arabidopsis_thaliana.TAIR10.dna.toplevel.fa.gz" \\
     --gff "$DEST/Arabidopsis_thaliana.TAIR10.${RELEASE}.gff3.gz" \\
     --motifs "$DEST/JASPAR2024_CORE_plants_non-redundant_pfms_jaspar.txt" \\
     --tf-map tf_map.tsv --promoter-len 1000 --pvalue 1e-4 --out evidence.tsv

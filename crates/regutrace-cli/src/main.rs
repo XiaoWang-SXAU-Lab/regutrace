@@ -22,6 +22,7 @@ struct Args {
     promoters: Option<PathBuf>,
     promoters_out: Option<PathBuf>,
     promoter_len: usize,
+    downstream_len: usize,
     pvalue: f64,
     min_score: Option<f64>,
     background: [f64; 4],
@@ -42,6 +43,7 @@ impl Default for Args {
             promoters: None,
             promoters_out: None,
             promoter_len: 1000,
+            downstream_len: 0,
             pvalue: 1e-4,
             min_score: None,
             background: [0.25; 4],
@@ -64,6 +66,7 @@ USAGE:\n\
 \n\
 SCAN OPTIONS:\n\
   --promoter-len <bp>     upstream length (default 1000)\n\
+  --downstream <bp>       downstream window incl. TSS (default 0; PlantRegMap uses 100)\n\
   --promoters <fa>        scan a promoter FASTA directly (skip genome/GFF)\n\
   --promoters-out <fa>    export extracted promoters as FASTA\n\
   --pvalue <p>            PWM hit p-value cutoff (default 1e-4)\n\
@@ -87,19 +90,27 @@ fn parse_background(s: &str) -> Result<[f64; 4]> {
         .map(|x| x.trim().parse::<f64>())
         .collect::<std::result::Result<Vec<_>, _>>()
         .with_context(|| format!("invalid background: {s}"))?;
-    if vals.len() != 4 || vals.iter().any(|v| *v < 0.0) {
-        bail!("background must be four non-negative numbers A,C,G,T");
+    if vals.len() != 4 || vals.iter().any(|v| !v.is_finite() || *v <= 0.0) {
+        bail!("background must be four finite positive numbers A,C,G,T");
     }
-    let sum: f64 = vals.iter().sum();
-    if sum <= 0.0 {
-        bail!("background sum must be positive");
+    // Scale by the maximum first so four large finite weights cannot overflow
+    // the sum and normalize to all zeros.
+    let max = vals.iter().copied().fold(0.0_f64, f64::max);
+    let scaled: Vec<f64> = vals.iter().map(|v| v / max).collect();
+    let sum: f64 = scaled.iter().sum();
+    if !sum.is_finite() || sum <= 0.0 {
+        bail!("background sum is not finite");
     }
-    Ok([
-        vals[0] / sum,
-        vals[1] / sum,
-        vals[2] / sum,
-        vals[3] / sum,
-    ])
+    let out = [
+        scaled[0] / sum,
+        scaled[1] / sum,
+        scaled[2] / sum,
+        scaled[3] / sum,
+    ];
+    if out.iter().any(|v| !v.is_finite() || *v <= 0.0) {
+        bail!("background values are too disparate after normalization");
+    }
+    Ok(out)
 }
 
 fn parse_scan_args(args: &[String]) -> Result<Args> {
@@ -139,6 +150,13 @@ fn parse_scan_args(args: &[String]) -> Result<Args> {
                     .context("--promoter-len needs a value")?
                     .parse()
                     .context("invalid --promoter-len")?
+            }
+            "--downstream" => {
+                a.downstream_len = it
+                    .next()
+                    .context("--downstream needs a value")?
+                    .parse()
+                    .context("invalid --downstream")?
             }
             "--pvalue" => {
                 a.pvalue = it
@@ -256,7 +274,9 @@ fn cmd_scan(args: &[String]) -> Result<()> {
             }
             match genome.seq(&gene.chrom) {
                 Some(seq) => {
-                    if let Some(p) = promoter::extract_promoter(seq, gene, args.promoter_len) {
+                    if let Some(p) =
+                        promoter::extract_promoter(seq, gene, args.promoter_len, args.downstream_len)
+                    {
                         v.push(p);
                     }
                 }
@@ -297,19 +317,12 @@ fn cmd_scan(args: &[String]) -> Result<()> {
         eprintln!("warning: {missing_motif} TF–motif rows reference motifs not in the library");
     }
 
-    struct Cache {
-        log_odds: Vec<[f64; 4]>,
-        null: scan::PwmNull,
-    }
-    let mut cache: HashMap<String, Cache> = HashMap::new();
+    let mut scanners: HashMap<String, scan::Scanner> = HashMap::new();
     for motif_id in motif_to_tfs.keys() {
         let p = motif_by_id.get(motif_id).unwrap();
-        cache.insert(
+        scanners.insert(
             motif_id.clone(),
-            Cache {
-                log_odds: p.log_odds(&args.background),
-                null: scan::build_null(p, &args.background, 10.0),
-            },
+            scan::Scanner::new(p, &args.background, 10.0),
         );
     }
 
@@ -317,15 +330,8 @@ fn cmd_scan(args: &[String]) -> Result<()> {
     let mut prediction_hits = 0usize;
     for prom in &promoters {
         for (motif_id, tfs) in &motif_to_tfs {
-            let c = cache.get(motif_id).unwrap();
-            let hits = scan::scan_promoter(
-                &prom.seq,
-                &c.log_odds,
-                &c.null,
-                args.pvalue,
-                args.min_score,
-                args.both_strands,
-            );
+            let scanner = scanners.get(motif_id).unwrap();
+            let hits = scanner.scan(&prom.seq, args.pvalue, args.min_score, args.both_strands);
             for hit in hits {
                 prediction_hits += 1;
                 for tf in tfs {
@@ -473,5 +479,28 @@ fn main() {
     if let Err(e) = res {
         eprintln!("error: {e:#}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn background_must_be_positive_and_finite() {
+        assert!(parse_background("0.25,0.25,0.25,0.25").is_ok());
+        assert!(parse_background("2,1,1,0").is_err());
+        assert!(parse_background("1,0,0,0").is_err());
+        assert!(parse_background("NaN,0.25,0.25,0.25").is_err());
+        assert!(parse_background("inf,0.25,0.25,0.25").is_err());
+        let huge = parse_background("1e308,1e308,1e308,1e308").unwrap();
+        for v in huge {
+            assert!((v - 0.25).abs() < 1e-12, "v={v}");
+        }
+        let tiny = parse_background("1e-308,1e-308,1e-308,1e-308").unwrap();
+        for v in tiny {
+            assert!((v - 0.25).abs() < 1e-12, "v={v}");
+        }
+        assert!(parse_background("1e308,1e-308,1e-308,1e-308").is_err());
     }
 }

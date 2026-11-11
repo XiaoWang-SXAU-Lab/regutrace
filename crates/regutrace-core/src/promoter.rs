@@ -32,30 +32,54 @@ pub fn reverse_complement(seq: &[u8]) -> Vec<u8> {
         .collect()
 }
 
-/// Extract `upstream_len` bases upstream of the representative TSS.
+/// Extract a promoter window: `upstream_len` bases upstream of the
+/// representative TSS plus `downstream_len` bases downstream.
+///
+/// With `downstream_len == 0` the historical upstream-only window is used and
+/// the TSS base is excluded. With `downstream_len > 0` the downstream count
+/// includes the TSS base so the window stays contiguous and symmetric on both
+/// strands; this matches common TSS -500/+100 conventions (PlantRegMap uses
+/// 500 upstream and 100 downstream, counting the TSS as the first downstream
+/// base).
 ///
 /// `chrom_seq` must be the full chromosome sequence (0-based, ACGTN).
-pub fn extract_promoter(chrom_seq: &[u8], gene: &GeneModel, upstream_len: usize) -> Option<Promoter> {
+pub fn extract_promoter(
+    chrom_seq: &[u8],
+    gene: &GeneModel,
+    upstream_len: usize,
+    downstream_len: usize,
+) -> Option<Promoter> {
     let (start0, end0, oriented) = if gene.strand == '-' {
-        // tss is 1-based; for '-' it is the last base of the transcript, so the
-        // 0-based index after the TSS base is `tss`.
-        let start0 = gene.tss as usize;
-        if start0 >= chrom_seq.len() {
+        // tss is 1-based; for '-' the upstream side is to the right and the
+        // downstream side is to the left.
+        let tss = gene.tss as usize;
+        if tss == 0 || tss > chrom_seq.len() {
             return None;
         }
-        let end0 = start0.saturating_add(upstream_len).min(chrom_seq.len());
-        if end0 <= start0 {
+        let start0 = if downstream_len == 0 {
+            // Historical upstream-only window: exclude the TSS base.
+            tss
+        } else {
+            // Downstream window includes the TSS base; `downstream_len` counts
+            // the TSS as the first downstream base.
+            tss.saturating_sub(downstream_len)
+        };
+        let end0 = tss.saturating_add(upstream_len).min(chrom_seq.len());
+        if start0 >= end0 {
             return None;
         }
         (start0, end0, reverse_complement(&chrom_seq[start0..end0]))
     } else {
         // tss is 1-based; convert to the 0-based TSS base.
         let tss0 = gene.tss.saturating_sub(1) as usize;
-        if tss0 == 0 || tss0 > chrom_seq.len() {
+        if tss0 >= chrom_seq.len() {
             return None;
         }
         let start0 = tss0.saturating_sub(upstream_len);
-        let end0 = tss0;
+        let end0 = tss0.saturating_add(downstream_len).min(chrom_seq.len());
+        if start0 >= end0 {
+            return None;
+        }
         (start0, end0, chrom_seq[start0..end0].to_vec())
     };
     if oriented.is_empty() {
@@ -93,20 +117,42 @@ mod tests {
     fn plus_strand_takes_upstream() {
         let seq = b"AAAACCCCGGGGTTTT";
         // tss at 1-based 10 -> 0-based 9
-        let p = extract_promoter(seq, &gene('+', 10), 4).unwrap();
+        let p = extract_promoter(seq, &gene('+', 10), 4, 0).unwrap();
         assert_eq!(p.start, 6); // 0-based 5..9 -> 1-based 6..9
         assert_eq!(p.end, 9);
         assert_eq!(p.seq.as_slice(), b"CCCG");
     }
 
     #[test]
-    fn minus_strand_reverse_complements_downstream() {
+    fn plus_strand_includes_downstream() {
+        let seq = b"AAAACCCCGGGGTTTT";
+        // tss at 1-based 10 (0-based 9); upstream 4 + downstream 2
+        let p = extract_promoter(seq, &gene('+', 10), 4, 2).unwrap();
+        assert_eq!(p.start, 6);
+        assert_eq!(p.end, 11);
+        assert_eq!(p.seq.as_slice(), b"CCCGGG");
+    }
+
+    #[test]
+    fn minus_strand_reverse_complements_upstream_by_default() {
         let seq = b"AAAACCCCGGGGTTTT";
         // tss at 1-based 9 -> 0-based index after TSS is 9; window 9..13
-        let p = extract_promoter(seq, &gene('-', 9), 4).unwrap();
+        let p = extract_promoter(seq, &gene('-', 9), 4, 0).unwrap();
         assert_eq!(p.start, 10);
         assert_eq!(p.end, 13);
         // genome 9..13 = GGGT; reverse complement = ACCC
         assert_eq!(p.seq.as_slice(), b"ACCC");
+    }
+
+    #[test]
+    fn minus_strand_includes_downstream() {
+        let seq = b"AAAACCCCGGGGTTTT";
+        // tss base is 1-based 9; the downstream window counts the TSS as its
+        // first base, so 2 downstream bases are 8..9, upstream 4 are 10..13.
+        // Genomic window 8..13 (CGGGGT); reverse complement = ACCCCG.
+        let p = extract_promoter(seq, &gene('-', 9), 4, 2).unwrap();
+        assert_eq!(p.start, 8);
+        assert_eq!(p.end, 13);
+        assert_eq!(p.seq.as_slice(), b"ACCCCG");
     }
 }

@@ -48,10 +48,15 @@ Duplicate imports are ignored via `record_key`.
   the genomic window is reverse-complemented.
 - `hit_start/hit_end` are positions in the oriented promoter sequence.
 - `promoter_start/promoter_end` are the genomic window (1-based inclusive).
+- With `--downstream > 0` the downstream count includes the TSS base (the window
+  is symmetric on both strands); with the default 0 it is upstream-only and
+  excludes the TSS base.
 
 ## Adding evidence
 
 Use the unified TSV with `--evidence`/`--user-list`, or a user list with columns
 `tf,target,evidence_type,evidence_level,method,source,pmid,condition,score,notes`.
-Import into SQLite with `regutrace import`. Keep `evidence_level` honest; do not
-label predictions as A/B/C.
+Import into SQLite with `regutrace import`. `evidence_level` is required for user
+lists and must be one of A/B/C/D/E; missing or invalid values are rejected (lower
+case is normalized to upper case). Keep `evidence_level` honest; do not label
+predictions as A/B/C.

@@ -83,6 +83,8 @@ AT1G00010\tG2\tpoint_validation_emsa\tA\tEMSA\tPMID:123\t123\n",
             map_path.to_str().unwrap(),
             "--promoter-len",
             "100",
+            "--downstream",
+            "100",
             "--pvalue",
             "1e-3",
             "--annotation",
@@ -105,6 +107,29 @@ AT1G00010\tG2\tpoint_validation_emsa\tA\tEMSA\tPMID:123\t123\n",
     assert!(text.contains("GENE1"), "{text}");
     assert!(text.contains("GENE2"), "{text}");
     assert!(text.lines().count() >= 3, "{text}");
+
+    let rows: Vec<Vec<&str>> = text.lines().skip(1).map(|l| l.split('\t').collect()).collect();
+    // Columns: 0 tf_id, 1 tf_symbol, 2 target_id, 3 target_symbol, 4 evidence_type,
+    // 5 evidence_level, 10 promoter_start, 11 promoter_end, 13 hit_start,
+    // 14 hit_end, 15 strand.
+    let g1 = rows
+        .iter()
+        .find(|r| r[2] == "G1" && r[4] == "prediction_motif")
+        .expect("G1 prediction");
+    assert_eq!(g1[10], "101");
+    assert_eq!(g1[11], "300");
+    assert_eq!(g1[13], "51");
+    assert_eq!(g1[14], "56");
+    assert_eq!(g1[15], "+");
+    let g2 = rows
+        .iter()
+        .find(|r| r[2] == "G2" && r[4] == "prediction_motif")
+        .expect("G2 prediction");
+    assert_eq!(g2[10], "701");
+    assert_eq!(g2[11], "900");
+    assert_eq!(g2[13], "95");
+    assert_eq!(g2[14], "100");
+    assert_eq!(g2[15], "+");
 
     let db_path = dir.join("evidence.db");
     let import = Command::new(bin)

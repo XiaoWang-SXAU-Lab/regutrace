@@ -37,6 +37,8 @@ struct TxInfo {
     transcript_id: String,
     start: u64,
     end: u64,
+    chrom: String,
+    strand: char,
 }
 
 fn attr(attrs: &str, key: &str) -> Option<String> {
@@ -90,6 +92,14 @@ pub fn read_gff(path: &Path) -> Result<Vec<GeneModel>> {
         let end: u64 = fields[4]
             .parse()
             .with_context(|| format!("GFF end at line {}", lineno + 1))?;
+        if start == 0 || end < start {
+            bail!(
+                "GFF line {} has invalid coordinates {}-{}",
+                lineno + 1,
+                start,
+                end
+            );
+        }
         let strand = fields[6].chars().next().unwrap_or('+');
         let attrs = fields[8];
 
@@ -115,15 +125,24 @@ pub fn read_gff(path: &Path) -> Result<Vec<GeneModel>> {
             let Some(parent_raw) = attr(attrs, "Parent") else {
                 continue;
             };
-            let parent = clean_id(&parent_raw);
-            let transcript_id = attr(attrs, "ID")
-                .map(|v| clean_id(&v))
-                .unwrap_or_else(|| format!("{parent}.t{}", tx.get(&parent).map_or(1, |v| v.len() + 1)));
-            tx.entry(parent).or_default().push(TxInfo {
-                transcript_id,
-                start,
-                end,
-            });
+            for parent_raw in parent_raw.split(',') {
+                let parent = clean_id(parent_raw);
+                if parent.is_empty() {
+                    continue;
+                }
+                let transcript_id = attr(attrs, "ID")
+                    .map(|v| clean_id(&v))
+                    .unwrap_or_else(|| {
+                        format!("{parent}.t{}", tx.get(&parent).map_or(1, |v| v.len() + 1))
+                    });
+                tx.entry(parent).or_default().push(TxInfo {
+                    transcript_id,
+                    start,
+                    end,
+                    chrom: chrom.clone(),
+                    strand,
+                });
+            }
         }
     }
 
@@ -137,10 +156,10 @@ pub fn read_gff(path: &Path) -> Result<Vec<GeneModel>> {
                 parent.clone(),
                 GeneInfo {
                     symbol: parent.clone(),
-                    chrom: String::new(),
+                    chrom: first.chrom.clone(),
                     start: first.start,
                     end: first.end,
-                    strand: '+',
+                    strand: first.strand,
                 },
             );
         }
@@ -151,15 +170,17 @@ pub fn read_gff(path: &Path) -> Result<Vec<GeneModel>> {
         let best = tx
             .get(&gene_id)
             .and_then(|v| v.iter().max_by_key(|t| t.end.saturating_sub(t.start)));
+        let strand = if info.strand == '+' || info.strand == '-' {
+            info.strand
+        } else {
+            best.map(|t| t.strand).unwrap_or('+')
+        };
         let (transcript_id, tss) = match best {
             Some(t) => (
                 Some(t.transcript_id.clone()),
-                if info.strand == '-' { t.end } else { t.start },
+                if strand == '-' { t.end } else { t.start },
             ),
-            None => (
-                None,
-                if info.strand == '-' { info.end } else { info.start },
-            ),
+            None => (None, if strand == '-' { info.end } else { info.start }),
         };
         out.push(GeneModel {
             gene_id,
@@ -167,7 +188,7 @@ pub fn read_gff(path: &Path) -> Result<Vec<GeneModel>> {
             chrom: info.chrom,
             start: info.start,
             end: info.end,
-            strand: info.strand,
+            strand,
             transcript_id,
             tss,
         });
@@ -202,6 +223,67 @@ mod tests {
         let minus = genes.iter().find(|g| g.gene_id == "AT2G00020").unwrap();
         assert_eq!(minus.strand, '-');
         assert_eq!(minus.tss, 1100);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn parses_transcripts_without_gene_features() {
+        let path =
+            std::env::temp_dir().join(format!("regutrace_gff_nogene_{}.gff3", std::process::id()));
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            writeln!(f, "Chr1\ttest\tmRNA\t100\t500\t.\t+\t.\tID=tx1;Parent=geneA").unwrap();
+            writeln!(f, "Chr2\ttest\ttranscript\t900\t1200\t.\t-\t.\tID=tx2;Parent=geneB")
+                .unwrap();
+        }
+        let genes = read_gff(&path).unwrap();
+        assert_eq!(genes.len(), 2);
+        let a = genes.iter().find(|g| g.gene_id == "geneA").unwrap();
+        assert_eq!(a.chrom, "Chr1");
+        assert_eq!(a.strand, '+');
+        assert_eq!(a.tss, 100);
+        assert_eq!(a.transcript_id.as_deref(), Some("tx1"));
+        let b = genes.iter().find(|g| g.gene_id == "geneB").unwrap();
+        assert_eq!(b.chrom, "Chr2");
+        assert_eq!(b.strand, '-');
+        assert_eq!(b.tss, 1200);
+        assert_eq!(b.transcript_id.as_deref(), Some("tx2"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn handles_multiple_parents() {
+        let path =
+            std::env::temp_dir().join(format!("regutrace_gff_multi_{}.gff3", std::process::id()));
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            writeln!(f, "Chr1\ttest\tgene\t100\t500\t.\t+\t.\tID=geneA").unwrap();
+            writeln!(f, "Chr1\ttest\tgene\t100\t500\t.\t+\t.\tID=geneB").unwrap();
+            writeln!(
+                f,
+                "Chr1\ttest\tmRNA\t100\t500\t.\t+\t.\tID=tx1;Parent=geneA,geneB"
+            )
+            .unwrap();
+        }
+        let genes = read_gff(&path).unwrap();
+        assert_eq!(genes.len(), 2);
+        for id in ["geneA", "geneB"] {
+            let g = genes.iter().find(|g| g.gene_id == id).unwrap();
+            assert_eq!(g.transcript_id.as_deref(), Some("tx1"));
+        }
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn rejects_invalid_coordinates() {
+        let path =
+            std::env::temp_dir().join(format!("regutrace_gff_bad_{}.gff3", std::process::id()));
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            writeln!(f, "Chr1\ttest\tgene\t500\t100\t.\t+\t.\tID=geneA").unwrap();
+        }
+        let err = read_gff(&path).unwrap_err().to_string();
+        assert!(err.contains("invalid coordinates"), "{err}");
         let _ = std::fs::remove_file(path);
     }
 }

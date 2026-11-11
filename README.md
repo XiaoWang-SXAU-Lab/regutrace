@@ -62,6 +62,9 @@ regutrace stats  --db reguledger.db
 regutrace export --db reguledger.db --out evidence_export.tsv
 ```
 
+Add `--downstream 100` to include 100 bp past the TSS; PlantRegMap uses
+TSS −500/+100, i.e. `--promoter-len 500 --downstream 100`.
+
 Or scan a promoter FASTA directly (useful for benchmarks/other tools):
 
 ```bash
