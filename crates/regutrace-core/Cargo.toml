@@ -12,3 +12,5 @@ anyhow = "1.0.104"
 csv = "1.4.0"
 flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
 rusqlite = { version = "0.41.1", features = ["bundled"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"

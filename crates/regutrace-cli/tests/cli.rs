@@ -68,6 +68,7 @@ Chr1\ttest\tmRNA\t601\t800\t.\t-\t.\tID=transcript:G2.t1;Parent=gene:G2\n",
 AT1G00010\tG2\tpoint_validation_emsa\tA\tEMSA\tPMID:123\t123\n",
     );
     let out_path = dir.join("out.tsv");
+    let scan_report = dir.join("scan-report.json");
 
     let bin = env!("CARGO_BIN_EXE_regutrace");
     let output = Command::new(bin)
@@ -93,6 +94,8 @@ AT1G00010\tG2\tpoint_validation_emsa\tA\tEMSA\tPMID:123\t123\n",
             user_path.to_str().unwrap(),
             "--out",
             out_path.to_str().unwrap(),
+            "--report-json",
+            scan_report.to_str().unwrap(),
         ])
         .output()
         .unwrap();
@@ -107,6 +110,16 @@ AT1G00010\tG2\tpoint_validation_emsa\tA\tEMSA\tPMID:123\t123\n",
     assert!(text.contains("GENE1"), "{text}");
     assert!(text.contains("GENE2"), "{text}");
     assert!(text.lines().count() >= 3, "{text}");
+
+    let scan_json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&scan_report).unwrap()).unwrap();
+    assert_eq!(scan_json["command"], "scan");
+    assert_eq!(scan_json["summary"]["errors"], 0);
+    assert!(scan_json["diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|d| d["code"] == "SCAN_SUMMARY"));
 
     let rows: Vec<Vec<&str>> = text.lines().skip(1).map(|l| l.split('\t').collect()).collect();
     // Columns: 0 tf_id, 1 tf_symbol, 2 target_id, 3 target_symbol, 4 evidence_type,
@@ -162,6 +175,68 @@ AT1G00010\tG2\tpoint_validation_emsa\tA\tEMSA\tPMID:123\t123\n",
     assert!(
         auto_text.lines().any(|l| l.starts_with("TEST\tTEST\tG1\t")),
         "{auto_text}"
+    );
+
+    let validate_report = dir.join("validate-report.json");
+    let validate = Command::new(bin)
+        .args([
+            "validate",
+            "--genome",
+            genome_path.to_str().unwrap(),
+            "--gff",
+            gff_path.to_str().unwrap(),
+            "--motifs",
+            motif_path.to_str().unwrap(),
+            "--tf-map",
+            map_path.to_str().unwrap(),
+            "--annotation",
+            anno_path.to_str().unwrap(),
+            "--user-list",
+            user_path.to_str().unwrap(),
+            "--promoter-len",
+            "100",
+            "--downstream",
+            "100",
+            "--report-json",
+            validate_report.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        validate.status.success(),
+        "validate stderr: {}",
+        String::from_utf8_lossy(&validate.stderr)
+    );
+    let validate_json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&validate_report).unwrap()).unwrap();
+    assert_eq!(validate_json["command"], "validate");
+    assert_eq!(validate_json["summary"]["errors"], 0);
+    assert!(validate_json["diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|d| d["severity"] == "warning"));
+
+    let strict = Command::new(bin)
+        .args([
+            "validate",
+            "--genome",
+            genome_path.to_str().unwrap(),
+            "--gff",
+            gff_path.to_str().unwrap(),
+            "--motifs",
+            motif_path.to_str().unwrap(),
+            "--promoter-len",
+            "100",
+            "--strict",
+        ])
+        .output()
+        .unwrap();
+    assert!(!strict.status.success());
+    assert!(
+        String::from_utf8_lossy(&strict.stderr).contains("STRICT_WARNINGS"),
+        "{}",
+        String::from_utf8_lossy(&strict.stderr)
     );
 
     let db_path = dir.join("evidence.db");

@@ -2,6 +2,7 @@
 //! PWM motifs and user-provided evidence lists. Outputs evidence records with
 //! provenance, not a definitive GRN.
 
+pub mod diagnostics;
 pub mod fasta;
 pub mod gff;
 pub mod io;

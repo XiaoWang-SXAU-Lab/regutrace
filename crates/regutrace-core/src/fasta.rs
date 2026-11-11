@@ -31,31 +31,72 @@ pub fn open_reader(path: &Path) -> Result<Box<dyn Read>> {
     }
 }
 
+/// Split a sequence name into a normalized prefix family and numeric core.
+/// Examples: chr01 / chromosome1 / CHR1 -> ("chr", "1");
+/// scaffold_001 -> ("scaffold", "1"); 1 -> (None, "1").
+fn split_chrom(name: &str) -> (Option<&'static str>, String) {
+    let lower = name.trim().to_ascii_lowercase();
+    for (prefixes, family) in [
+        (&["chromosome", "chrom", "chr"][..], "chr"),
+        (&["scaffold", "scaf"][..], "scaffold"),
+        (&["contig", "ctg"][..], "contig"),
+        (&["linkage_group", "linkagegroup", "lg"][..], "lg"),
+    ] {
+        for prefix in prefixes {
+            if let Some(rest) = lower.strip_prefix(prefix) {
+                let rest = rest.trim_start_matches(|c: char| c == '_' || c == '-' || c == ' ');
+                let core = rest.trim_start_matches('0');
+                return (Some(family), if core.is_empty() { "0" } else { core }.to_string());
+            }
+        }
+    }
+    let core = lower.trim_start_matches('0');
+    (None, if core.is_empty() { "0" } else { core }.to_string())
+}
+
+/// Score alias candidates. Lower is better; None means the prefix families are
+/// different (for example scaffold_1 must not silently match chr1).
+fn chrom_match_score(query: Option<&'static str>, key: Option<&'static str>) -> Option<u8> {
+    match (query, key) {
+        (Some(a), Some(b)) if a == b => Some(0),
+        (None, None) => Some(1),
+        (Some("chr"), None) | (None, Some("chr")) => Some(2),
+        (Some(_), None) | (None, Some(_)) => Some(3),
+        _ => None,
+    }
+}
+
 impl Fasta {
-    /// Resolve common plant chromosome naming differences (`1`, `Chr1`,
-    /// `chr1`, `CHR1`).
+    /// Resolve common chromosome naming differences: case, `chr`/`chromosome`,
+    /// `scaffold`/`scaf`, `contig`/`ctg`, and zero padding (`chr1` vs `chr01`).
     pub fn seq(&self, chrom: &str) -> Option<&Vec<u8>> {
         if let Some(s) = self.seqs.get(chrom) {
             return Some(s);
         }
-        let core = chrom
-            .strip_prefix("Chr")
-            .or_else(|| chrom.strip_prefix("chr"))
-            .or_else(|| chrom.strip_prefix("CHR"))
-            .unwrap_or(chrom);
-        for c in [
-            format!("Chr{core}"),
-            format!("chr{core}"),
-            format!("CHR{core}"),
-            core.to_string(),
-        ] {
-            if c != chrom {
-                if let Some(s) = self.seqs.get(&c) {
-                    return Some(s);
-                }
+        if let Some((_, s)) = self
+            .seqs
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(chrom))
+        {
+            return Some(s);
+        }
+        let (query_family, query_core) = split_chrom(chrom);
+        let mut keys: Vec<&String> = self.seqs.keys().collect();
+        keys.sort();
+        let mut best: Option<(u8, &Vec<u8>)> = None;
+        for key in keys {
+            let (key_family, key_core) = split_chrom(key);
+            if key_core != query_core {
+                continue;
+            }
+            let Some(score) = chrom_match_score(query_family, key_family) else {
+                continue;
+            };
+            if best.as_ref().is_none_or(|(best_score, _)| score < *best_score) {
+                best = Some((score, self.seqs.get(key).unwrap()));
             }
         }
-        None
+        best.map(|(_, seq)| seq)
     }
 }
 
@@ -136,6 +177,23 @@ mod tests {
         assert_eq!(fa.seq("chr1").unwrap().as_slice(), b"ACGTACGT");
         assert_eq!(fa.seq("CHR1").unwrap().as_slice(), b"ACGTACGT");
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn resolves_chromosome_aliases() {
+        let mut seqs = HashMap::new();
+        seqs.insert("chr1".to_string(), b"AAA".to_vec());
+        seqs.insert("scaffold_1".to_string(), b"CCC".to_vec());
+        let fa = Fasta {
+            seqs,
+            order: vec![],
+        };
+        assert_eq!(fa.seq("Chr1").unwrap().as_slice(), b"AAA");
+        assert_eq!(fa.seq("CHR01").unwrap().as_slice(), b"AAA");
+        assert_eq!(fa.seq("chromosome1").unwrap().as_slice(), b"AAA");
+        assert_eq!(fa.seq("1").unwrap().as_slice(), b"AAA");
+        assert_eq!(fa.seq("scaffold1").unwrap().as_slice(), b"CCC");
+        assert!(fa.seq("contig1").is_none());
     }
 
     #[test]

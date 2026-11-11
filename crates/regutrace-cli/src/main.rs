@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
-use regutrace_core::{fasta, gff, io, promoter, pwm, scan, store::Store};
+use regutrace_core::{diagnostics, fasta, gff, io, promoter, pwm, scan, store::Store};
 
 struct Args {
     genome: Option<PathBuf>,
@@ -28,6 +28,8 @@ struct Args {
     background: [f64; 4],
     both_strands: bool,
     max_genes: Option<usize>,
+    report_json: Option<PathBuf>,
+    strict: bool,
 }
 
 impl Default for Args {
@@ -49,6 +51,8 @@ impl Default for Args {
             background: [0.25; 4],
             both_strands: true,
             max_genes: None,
+            report_json: None,
+            strict: false,
         }
     }
 }
@@ -63,6 +67,9 @@ USAGE:\n\
   regutrace import --db <evidence.db> --evidence <edges.tsv>\n\
   regutrace export --db <evidence.db> --out <edges.tsv>\n\
   regutrace stats --db <evidence.db>\n\
+  regutrace validate [--genome <fa> --gff <gff3>] [--motifs <jaspar>] \\\n\
+    [--tf-map <tsv>] [--annotation <tsv>] [--user-list <tsv>] \\\n\
+    [--report-json <report.json>] [--strict]\n\
 \n\
 SCAN OPTIONS:\n\
   --promoter-len <bp>     upstream length (default 1000)\n\
@@ -78,6 +85,8 @@ SCAN OPTIONS:\n\
   --max-genes <n>         only process the first n genes (testing)\n\
   --one-strand            scan only the plus strand of each promoter\n\
   --both-strands          scan both strands (default)\n\
+  --report-json <path>    write a machine-readable diagnostics report\n\
+  --strict                treat warnings as failure (validate)\n\
   -h, --help              show this help\n\
 \n\
 tf-map columns: tf_id, tf_symbol, family, motif_id (one row per TF–motif pair);\n\
@@ -178,6 +187,12 @@ fn parse_scan_args(args: &[String]) -> Result<Args> {
                         .context("invalid --max-genes")?,
                 )
             }
+            "--report-json" => {
+                a.report_json = Some(PathBuf::from(
+                    it.next().context("--report-json needs a value")?,
+                ))
+            }
+            "--strict" => a.strict = true,
             "--one-strand" => a.both_strands = false,
             "--both-strands" => a.both_strands = true,
             "-h" | "--help" => {
@@ -224,13 +239,195 @@ fn write_promoters_fasta(path: &std::path::Path, promoters: &[promoter::Promoter
     Ok(())
 }
 
-fn cmd_scan(args: &[String]) -> Result<()> {
-    let args = parse_scan_args(args)?;
+fn cmd_validate(raw: &[String]) -> Result<()> {
+    let args = parse_scan_args(raw)?;
+    let mut report = diagnostics::Report::new("validate");
+    let result = run_validate(&args, &mut report);
+    if let Err(e) = &result {
+        report.push(diagnostics::Diagnostic::error(
+            "VALIDATE_FAILED",
+            format!("{e:#}"),
+        ));
+    }
+    if args.strict && report.summary.warnings > 0 && !report.has_errors() {
+        report.error(
+            "STRICT_WARNINGS",
+            "validation failed because --strict is set",
+        );
+    }
+    for line in report.human_lines() {
+        eprintln!("{line}");
+    }
+    if let Some(path) = &args.report_json {
+        report.write_json(path)?;
+    }
+    if report.has_errors() {
+        return Err(anyhow::anyhow!("input validation failed"));
+    }
+    Ok(())
+}
+
+fn run_validate(args: &Args, report: &mut diagnostics::Report) -> Result<()> {
+    let mut any = false;
+
+    let motifs = if let Some(path) = &args.motifs {
+        any = true;
+        report.add_input("motifs", path);
+        let motifs = pwm::read_jaspar(path)?;
+        diagnostics::review_motifs(&motifs, path, report);
+        Some(motifs)
+    } else {
+        None
+    };
+
+    if let Some(path) = &args.tf_map {
+        any = true;
+        report.add_input("tf_map", path);
+        let tf_map = io::read_tf_map(path)?;
+        if let Some(motifs) = &motifs {
+            diagnostics::review_tf_map(&tf_map, motifs, path, report);
+        } else {
+            report.push(
+                diagnostics::Diagnostic::warning(
+                    "TFMAP_WITHOUT_MOTIFS",
+                    "tf-map provided without --motifs; motif matching was not checked",
+                )
+                .with_file(path),
+            );
+        }
+    }
+
+    let annotation = if let Some(path) = &args.annotation {
+        any = true;
+        report.add_input("annotation", path);
+        Some(io::read_annotation(path)?)
+    } else {
+        None
+    };
+
+    if let Some(path) = &args.user_list {
+        any = true;
+        report.add_input("user_list", path);
+        let rows = io::read_user_list(path)?;
+        diagnostics::review_user_list(&rows, path, report);
+    }
+
+    if let Some(path) = &args.promoters {
+        any = true;
+        report.add_input("promoters", path);
+        let fa = fasta::read_fasta(path)?;
+        diagnostics::review_fasta(&fa, path, report);
+        let mut promoters = Vec::new();
+        for id in &fa.order {
+            promoters.push(promoter::Promoter {
+                gene_id: id.clone(),
+                symbol: id.clone(),
+                chrom: String::new(),
+                strand: '+',
+                start: 0,
+                end: 0,
+                seq: fa.seqs.get(id).unwrap().clone(),
+            });
+        }
+        diagnostics::review_promoters(&promoters, None, report);
+        if annotation.is_some() {
+            report.info(
+                "ANNOTATION_NOT_CHECKED",
+                "annotation coverage needs gene models; provide --genome/--gff",
+            );
+        }
+    } else if args.genome.is_some() || args.gff.is_some() {
+        any = true;
+        let genome_path = args
+            .genome
+            .as_ref()
+            .context("--gff requires --genome")?;
+        let gff_path = args.gff.as_ref().context("--genome requires --gff")?;
+        report.add_input("genome", genome_path);
+        report.add_input("gff", gff_path);
+        let fa = fasta::read_fasta(genome_path)?;
+        diagnostics::review_fasta(&fa, genome_path, report);
+        let (genes, gff_stats) = gff::read_gff_with_stats(gff_path)?;
+        diagnostics::review_gff(&genes, &gff_stats, gff_path, report);
+        diagnostics::review_chromosomes(&genes, &fa, gff_path, genome_path, report);
+        let mut promoters = Vec::new();
+        let mut skipped = 0usize;
+        for gene in &genes {
+            match fa.seq(&gene.chrom) {
+                Some(seq) => {
+                    if let Some(p) =
+                        promoter::extract_promoter(seq, gene, args.promoter_len, args.downstream_len)
+                    {
+                        promoters.push(p);
+                    } else {
+                        skipped += 1;
+                    }
+                }
+                None => skipped += 1,
+            }
+        }
+        if skipped > 0 {
+            report.push(
+                diagnostics::Diagnostic::warning(
+                    "PROMOTER_SKIPPED",
+                    format!("{skipped} gene(s) produced no promoter"),
+                )
+                .with_file(gff_path)
+                .with_context("count", skipped)
+                .with_suggestion("check chromosome names and TSS coordinates"),
+            );
+        }
+        diagnostics::review_promoters(
+            &promoters,
+            Some(args.promoter_len + args.downstream_len),
+            report,
+        );
+        if let (Some(annotation), Some(path)) = (&annotation, &args.annotation) {
+            diagnostics::review_annotation(annotation, &genes, path, report);
+        }
+    }
+
+    if !any {
+        report.push(
+            diagnostics::Diagnostic::error("NO_INPUTS", "no input files were provided")
+                .with_suggestion(
+                    "provide --genome/--gff, --promoters, --motifs, --tf-map, --annotation or --user-list",
+                ),
+        );
+    }
+    if !report.has_errors() {
+        report.info("VALIDATE_OK", "input review completed without errors");
+    }
+    Ok(())
+}
+
+fn cmd_scan(raw: &[String]) -> Result<()> {
+    let args = parse_scan_args(raw)?;
+    let mut report = diagnostics::Report::new("scan");
+    let result = run_scan(&args, &mut report);
+    if let Err(e) = &result {
+        report.push(diagnostics::Diagnostic::error(
+            "SCAN_FAILED",
+            format!("{e:#}"),
+        ));
+    }
+    for line in report.human_lines() {
+        eprintln!("{line}");
+    }
+    if let Some(path) = &args.report_json {
+        report.write_json(path)?;
+    }
+    result
+}
+
+fn run_scan(args: &Args, report: &mut diagnostics::Report) -> Result<()> {
     let motifs_path = required(args.motifs.clone(), "--motifs")?;
     let out_path = required(args.out.clone(), "--out")?;
+    report.add_input("motifs", &motifs_path);
 
     eprintln!("reading motifs: {}", motifs_path.display());
     let motifs = pwm::read_jaspar(&motifs_path)?;
+    diagnostics::review_motifs(&motifs, &motifs_path, report);
     let tf_map: Vec<io::TfMotif> = match &args.tf_map {
         Some(path) => io::read_tf_map(path)?,
         None => {
@@ -253,18 +450,32 @@ fn cmd_scan(args: &[String]) -> Result<()> {
                 .collect()
         }
     };
+    if let Some(path) = &args.tf_map {
+        report.add_input("tf_map", path);
+        diagnostics::review_tf_map(&tf_map, &motifs, path, report);
+    } else {
+        report.info(
+            "TFMAP_AUTO",
+            format!("derived {} TF–motif row(s) from motif names", tf_map.len()),
+        );
+    }
     let mut motif_by_id: HashMap<String, pwm::Pwm> = HashMap::new();
     for m in motifs {
         motif_by_id.entry(m.id.clone()).or_insert(m);
     }
     let annotation = match &args.annotation {
-        Some(p) => io::read_annotation(p)?,
+        Some(p) => {
+            report.add_input("annotation", p);
+            io::read_annotation(p)?
+        }
         None => HashMap::new(),
     };
 
     let (promoters, gene_count, missing_chrom) = if let Some(promoters_path) = &args.promoters {
         eprintln!("reading promoter FASTA: {}", promoters_path.display());
+        report.add_input("promoters", promoters_path);
         let fa = fasta::read_fasta(promoters_path)?;
+        diagnostics::review_fasta(&fa, promoters_path, report);
         let mut v = Vec::new();
         for id in &fa.order {
             if args.max_genes.is_some_and(|n| v.len() >= n) {
@@ -277,17 +488,26 @@ fn cmd_scan(args: &[String]) -> Result<()> {
                 strand: '+',
                 start: 0,
                 end: 0,
-                seq: fa.seqs[id].clone(),
+                seq: fa.seqs.get(id).unwrap().clone(),
             });
         }
+        diagnostics::review_promoters(&v, None, report);
         (v, fa.order.len(), 0usize)
     } else {
         let genome_path = required(args.genome.clone(), "--genome")?;
         let gff_path = required(args.gff.clone(), "--gff")?;
+        report.add_input("genome", &genome_path);
+        report.add_input("gff", &gff_path);
         eprintln!("reading genome: {}", genome_path.display());
         let genome = fasta::read_fasta(&genome_path)?;
+        diagnostics::review_fasta(&genome, &genome_path, report);
         eprintln!("reading GFF: {}", gff_path.display());
-        let genes = gff::read_gff(&gff_path)?;
+        let (genes, gff_stats) = gff::read_gff_with_stats(&gff_path)?;
+        diagnostics::review_gff(&genes, &gff_stats, &gff_path, report);
+        diagnostics::review_chromosomes(&genes, &genome, &gff_path, &genome_path, report);
+        if let Some(path) = &args.annotation {
+            diagnostics::review_annotation(&annotation, &genes, path, report);
+        }
         let mut v = Vec::new();
         let mut missing = 0usize;
         for gene in &genes {
@@ -305,6 +525,11 @@ fn cmd_scan(args: &[String]) -> Result<()> {
                 None => missing += 1,
             }
         }
+        diagnostics::review_promoters(
+            &v,
+            Some(args.promoter_len + args.downstream_len),
+            report,
+        );
         (v, genes.len(), missing)
     };
     eprintln!(
@@ -392,7 +617,9 @@ fn cmd_scan(args: &[String]) -> Result<()> {
 
     let user_count = match &args.user_list {
         Some(path) => {
+            report.add_input("user_list", path);
             let mut user = io::read_user_list(path)?;
+            diagnostics::review_user_list(&user, path, report);
             let tf_symbol_by_id: HashMap<&str, &str> = tf_map
                 .iter()
                 .map(|t| (t.tf_id.as_str(), t.tf_symbol.as_str()))
@@ -434,6 +661,20 @@ fn cmd_scan(args: &[String]) -> Result<()> {
         edges.len()
     );
     eprintln!("wrote {}", out_path.display());
+    report.push(
+        diagnostics::Diagnostic::info(
+            "SCAN_SUMMARY",
+            format!(
+                "{} genes, {} promoters, {} motif hits, {} user rows, {} total evidence rows",
+                gene_count,
+                promoters.len(),
+                prediction_hits,
+                user_count,
+                edges.len()
+            ),
+        )
+        .with_context("output", out_path.display().to_string()),
+    );
     Ok(())
 }
 
@@ -493,6 +734,7 @@ fn main() {
             return;
         }
         Some("scan") => cmd_scan(&args[1..]),
+        Some("validate") => cmd_validate(&args[1..]),
         Some("import") => cmd_import(&args[1..]),
         Some("export") => cmd_export(&args[1..]),
         Some("stats") => cmd_stats(&args[1..]),

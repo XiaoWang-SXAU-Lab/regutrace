@@ -11,6 +11,9 @@ readme = "../../README.md"
 anyhow = "1.0.104"
 regutrace-core = { path = "../regutrace-core" }
 
+[dev-dependencies]
+serde_json = "1.0.154"
+
 [[bin]]
 name = "regutrace"
 path = "src/main.rs"

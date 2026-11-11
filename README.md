@@ -75,6 +75,22 @@ Or scan a promoter FASTA directly (useful for benchmarks/other tools):
 regutrace scan --promoters promoters.fa --motifs ... --tf-map ... --out evidence.tsv
 ```
 
+## Input validation
+
+Review genome/GFF/motif/TF-map inputs without scanning and get a
+machine-readable report:
+
+```bash
+regutrace validate \
+  --genome data/genome.fa --gff data/annotation.gff3 \
+  --motifs data/jaspar.txt --tf-map tf_map.tsv \
+  --report-json report.json
+```
+
+`scan` also accepts `--report-json`. Reports use stable codes, severities,
+context and suggestions for frontends and RAG assistants; see
+[docs/DIAGNOSTICS.md](docs/DIAGNOSTICS.md).
+
 ## Evidence schema
 
 Unified TSV columns:
@@ -121,4 +137,7 @@ transcript feature falls back to its gene coordinates.
 - Without ATAC/ChIP, prediction cannot distinguish accessible from bound sites.
 - A `tf-map` is optional; without it, TF IDs come from motif header names.
   Mapping those names to gene IDs and Pfam HMM TF classification remain Phase 2.
+- GFF support covers `gene` + `mRNA`/`transcript`, `mRNA` without an explicit
+  gene, gene-only models, and CDS/exon-only fallbacks. Unusual feature layouts
+  are reported by `validate` rather than failing silently.
 - MIT licensed. Reference data licenses are documented by `fetch-data.sh`.

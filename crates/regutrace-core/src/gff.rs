@@ -3,13 +3,29 @@
 //! Coordinates are kept 1-based inclusive as in GFF3. `tss` is the 1-based
 //! coordinate of the transcription start site on the gene's strand.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
 
 use crate::fasta::open_reader;
+
+/// Summary of the features and inferred models in a GFF3 file. Used by the
+/// input review and the JSON diagnostics report.
+#[derive(Clone, Debug, Default)]
+pub struct GffStats {
+    pub feature_counts: BTreeMap<String, usize>,
+    pub genes: usize,
+    pub transcripts: usize,
+    pub genes_without_transcript: usize,
+    pub transcripts_without_features: usize,
+    pub multi_isoform_genes: usize,
+    pub inferred_genes: usize,
+    pub inferred_transcripts: usize,
+    pub chromosomes: Vec<String>,
+    pub strands: BTreeMap<String, usize>,
+}
 
 #[derive(Clone, Debug)]
 pub struct GeneModel {
@@ -89,12 +105,21 @@ fn transcript_metric(
 }
 
 pub fn read_gff(path: &Path) -> Result<Vec<GeneModel>> {
+    read_gff_with_stats(path).map(|(genes, _)| genes)
+}
+
+pub fn read_gff_with_stats(path: &Path) -> Result<(Vec<GeneModel>, GffStats)> {
     let reader = BufReader::new(open_reader(path)?);
     let mut genes: HashMap<String, GeneInfo> = HashMap::new();
     let mut tx: HashMap<String, Vec<TxInfo>> = HashMap::new();
     let mut exon_len: HashMap<String, u64> = HashMap::new();
     let mut cds_len: HashMap<String, u64> = HashMap::new();
     let mut utr_len: HashMap<String, u64> = HashMap::new();
+    let mut feature_counts: BTreeMap<String, usize> = BTreeMap::new();
+    let mut feature_span: HashMap<String, (String, char, u64, u64)> = HashMap::new();
+    let mut feature_coding: HashSet<String> = HashSet::new();
+    let mut inferred_genes = 0usize;
+    let mut inferred_transcripts = 0usize;
 
     for (lineno, line) in reader.lines().enumerate() {
         let line = line.with_context(|| format!("read GFF line {}", lineno + 1))?;
@@ -127,6 +152,7 @@ pub fn read_gff(path: &Path) -> Result<Vec<GeneModel>> {
         }
         let strand = fields[6].chars().next().unwrap_or('+');
         let attrs = fields[8];
+        *feature_counts.entry(kind.to_string()).or_insert(0) += 1;
 
         if kind == "gene" {
             let Some(gene_id_raw) = attr(attrs, "ID").or_else(|| attr(attrs, "Name")) else {
@@ -178,11 +204,65 @@ pub fn read_gff(path: &Path) -> Result<Vec<GeneModel>> {
                 if transcript_id.is_empty() {
                     continue;
                 }
+                let entry = feature_span
+                    .entry(transcript_id.clone())
+                    .or_insert((chrom.clone(), strand, start, end));
+                entry.2 = entry.2.min(start);
+                entry.3 = entry.3.max(end);
+                if kind == "exon" || kind == "CDS" {
+                    feature_coding.insert(transcript_id.clone());
+                }
                 match kind {
                     "exon" => *exon_len.entry(transcript_id).or_insert(0) += len,
                     "CDS" => *cds_len.entry(transcript_id).or_insert(0) += len,
                     _ => *utr_len.entry(transcript_id).or_insert(0) += len,
                 }
+            }
+        }
+    }
+
+    // Some GFFs have no gene/mRNA features and only CDS/exon records, or have
+    // genes whose CDS records point directly at the gene ID. Infer one
+    // transcript per coding parent so promoter extraction still works.
+    if genes.is_empty() && tx.is_empty() {
+        for (tid, (chrom, strand, start, end)) in &feature_span {
+            if !feature_coding.contains(tid) {
+                continue;
+            }
+            genes.insert(
+                tid.clone(),
+                GeneInfo {
+                    symbol: tid.clone(),
+                    chrom: chrom.clone(),
+                    start: *start,
+                    end: *end,
+                    strand: *strand,
+                },
+            );
+            tx.entry(tid.clone()).or_default().push(TxInfo {
+                transcript_id: tid.clone(),
+                start: *start,
+                end: *end,
+                chrom: chrom.clone(),
+                strand: *strand,
+            });
+            inferred_genes += 1;
+            inferred_transcripts += 1;
+        }
+    } else {
+        for (gene_id, _info) in &genes {
+            if tx.contains_key(gene_id) || !feature_coding.contains(gene_id) {
+                continue;
+            }
+            if let Some((chrom, strand, start, end)) = feature_span.get(gene_id) {
+                tx.entry(gene_id.clone()).or_default().push(TxInfo {
+                    transcript_id: gene_id.clone(),
+                    start: *start,
+                    end: *end,
+                    chrom: chrom.clone(),
+                    strand: *strand,
+                });
+                inferred_transcripts += 1;
             }
         }
     }
@@ -205,6 +285,34 @@ pub fn read_gff(path: &Path) -> Result<Vec<GeneModel>> {
             );
         }
     }
+
+    let mut chromosomes: BTreeSet<String> = BTreeSet::new();
+    let mut strands: BTreeMap<String, usize> = BTreeMap::new();
+    for g in genes.values() {
+        chromosomes.insert(g.chrom.clone());
+        *strands.entry(g.strand.to_string()).or_insert(0) += 1;
+    }
+    let transcript_count: usize = tx.values().map(|v| v.len()).sum();
+    let stats = GffStats {
+        feature_counts,
+        genes: genes.len(),
+        transcripts: transcript_count,
+        genes_without_transcript: genes.keys().filter(|g| !tx.contains_key(*g)).count(),
+        transcripts_without_features: tx
+            .values()
+            .flatten()
+            .filter(|t| {
+                !exon_len.contains_key(&t.transcript_id)
+                    && !cds_len.contains_key(&t.transcript_id)
+                    && !utr_len.contains_key(&t.transcript_id)
+            })
+            .count(),
+        multi_isoform_genes: tx.values().filter(|v| v.len() > 1).count(),
+        inferred_genes,
+        inferred_transcripts,
+        chromosomes: chromosomes.into_iter().collect(),
+        strands,
+    };
 
     let mut out = Vec::with_capacity(genes.len());
     for (gene_id, info) in genes {
@@ -251,7 +359,7 @@ pub fn read_gff(path: &Path) -> Result<Vec<GeneModel>> {
     if out.is_empty() {
         bail!("no gene features found in {}", path.display());
     }
-    Ok(out)
+    Ok((out, stats))
 }
 
 #[cfg(test)]
@@ -390,6 +498,51 @@ mod tests {
         let g = genes.iter().find(|g| g.gene_id == "G3").unwrap();
         assert_eq!(g.transcript_id.as_deref(), Some("tx2"));
         assert_eq!(g.tss, 150);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn infers_genes_from_cds_only_gff() {
+        let path = std::env::temp_dir().join(format!(
+            "regutrace_gff_cdsonly_{}.gff3",
+            std::process::id()
+        ));
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            writeln!(f, "Chr1\ttest\tCDS\t100\t200\t.\t+\t0\tParent=geneA").unwrap();
+            writeln!(f, "Chr1\ttest\tCDS\t300\t400\t.\t+\t0\tParent=geneA").unwrap();
+            writeln!(f, "Chr1\ttest\tCDS\t500\t600\t.\t-\t0\tParent=geneB").unwrap();
+        }
+        let (genes, stats) = read_gff_with_stats(&path).unwrap();
+        assert_eq!(stats.inferred_genes, 2);
+        assert_eq!(stats.inferred_transcripts, 2);
+        let a = genes.iter().find(|g| g.gene_id == "geneA").unwrap();
+        assert_eq!(a.strand, '+');
+        assert_eq!(a.tss, 100);
+        let b = genes.iter().find(|g| g.gene_id == "geneB").unwrap();
+        assert_eq!(b.strand, '-');
+        assert_eq!(b.tss, 600);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn infers_pseudo_transcript_for_gene_with_cds_only() {
+        let path = std::env::temp_dir().join(format!(
+            "regutrace_gff_gene_cds_{}.gff3",
+            std::process::id()
+        ));
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            writeln!(f, "Chr1\ttest\tgene\t100\t500\t.\t+\t.\tID=G4").unwrap();
+            writeln!(f, "Chr1\ttest\tCDS\t100\t200\t.\t+\t0\tParent=G4").unwrap();
+            writeln!(f, "Chr1\ttest\tCDS\t300\t400\t.\t+\t0\tParent=G4").unwrap();
+        }
+        let (genes, stats) = read_gff_with_stats(&path).unwrap();
+        assert_eq!(stats.inferred_transcripts, 1);
+        assert_eq!(stats.genes_without_transcript, 0);
+        let g = genes.iter().find(|g| g.gene_id == "G4").unwrap();
+        assert_eq!(g.transcript_id.as_deref(), Some("G4"));
+        assert_eq!(g.tss, 100);
         let _ = std::fs::remove_file(path);
     }
 
