@@ -19,17 +19,27 @@ use flate2::write::GzEncoder;
 use flate2::Compression;
 use rayon::prelude::*;
 use regutrace_core::{diagnostics, fasta, gff, io, promoter, pwm, scan, store::Store};
+use rustyhmmer::api::{Cutoff, HmmAnnotator};
+use rustyhmmer::seqio::Seq;
 use rusqlite::types::Value;
 use rusqlite::{params_from_iter, params, Connection, OpenFlags};
 use serde_json::Value as JsonValue;
+
+mod motif_transfer;
+mod pipeline;
+mod plant_tfs;
+mod trace;
 
 struct Args {
     genome: Option<PathBuf>,
     gff: Option<PathBuf>,
     motifs: Option<PathBuf>,
     tf_map: Option<PathBuf>,
+    tf_genes: Option<PathBuf>,
+    include_single_domain_fallback: bool,
     out: Option<PathBuf>,
     annotation: Option<PathBuf>,
+    allow_empty_tf_map: bool,
     user_list: Option<PathBuf>,
     promoters: Option<PathBuf>,
     promoters_out: Option<PathBuf>,
@@ -40,6 +50,8 @@ struct Args {
     background: [f64; 4],
     both_strands: bool,
     max_genes: Option<usize>,
+    gene_biotype: Option<String>,
+    gene_biotype_from_pack: bool,
     report_json: Option<PathBuf>,
     progress_json: Option<PathBuf>,
     stream: bool,
@@ -54,8 +66,11 @@ impl Default for Args {
             gff: None,
             motifs: None,
             tf_map: None,
+            tf_genes: None,
+            include_single_domain_fallback: false,
             out: None,
             annotation: None,
+            allow_empty_tf_map: false,
             user_list: None,
             promoters: None,
             promoters_out: None,
@@ -66,6 +81,8 @@ impl Default for Args {
             background: [0.25; 4],
             both_strands: true,
             max_genes: None,
+            gene_biotype: None,
+            gene_biotype_from_pack: false,
             report_json: None,
             progress_json: None,
             stream: false,
@@ -81,22 +98,60 @@ fn usage() {
 \n\
 USAGE:\n\
   regutrace scan --genome <fa[.gz]> --gff <gff3[.gz]> --motifs <jaspar.txt> \\\n\
-    [--tf-map <tf_map.tsv>] --out <edges.tsv> [options]\n\
+    [--tf-map <tf_map.tsv>] [--tf-genes <tf_genes.tsv>] --out <edges.tsv> [options]\n\
+  regutrace pipeline --reference-pack <dir> --genome <fa> --gff <gff3> \\\n\
+    (--proteins <faa> | --cds <fna>) --out-dir <dir> [options]\n\
+  regutrace trace --tf-genes <tsv> --tf-map <tsv> --evidence <tsv> --motifs <jaspar> \\\n\
+    [--reference-map <tsv>] [--pack-version <label>] [--include-single-domain-fallback] --out-dir <dir>\n\
   regutrace import --db <evidence.db> --evidence <edges.tsv>\n\
   regutrace export --db <evidence.db> --out <edges.tsv>\n\
   regutrace stats --db <evidence.db>\n\
   regutrace convert --input <edges.tsv|csv[.gz]> --out <file> \\\n\
     --format sqlite|csv|tsv|jsonl [--gzip]\n\
   regutrace prior --db <tf_target.db> --targets <genes.txt> --out <upstream.tsv>\n\
+  regutrace identify-plant-tfs (--proteins <faa[.gz]> | --cds <fna[.gz]>) (--hmm <models.hmm> | --hmm-list <files.txt>) --rules <rules.json>\n\
+    (--gene-map <map.tsv> | --gff <gff3> | --gene-ids) [--hmmsearch <exe>] [--threads <n>] --out <tf_genes.tsv>\n\
+  regutrace map-tf-motifs --tf-genes <tsv> --reference-map <tsv> (--forward <blast.tsv> --reverse <blast.tsv> | --proteins <faa> --reference-domains <faa> --dbd-models <json>) --out <tf_map.tsv>\n\
+  regutrace classify-tfs --domtblout <hits> --rules <rules.json> --out <proteins.tsv>\n\
+  regutrace identify-tfs --proteins <representative.faa> --hmm <tf.hmm> \\\n\
+    [--family-map <model_family.tsv>] [--evalue <e>] [--min-coverage <0..1>] --out <tf_genes.tsv>\n\
   regutrace validate-db --db <tf_target.db>\n\
   regutrace validate [--genome <fa> --gff <gff3>] [--motifs <jaspar>] \\\n\
     [--tf-map <tsv>] [--annotation <tsv>] [--user-list <tsv>] \\\n\
     [--report-json <report.json>] [--strict]\n\
 \n\
+PIPELINE OPTIONS:\n\
+  --reference-pack <dir>   versioned HMM/rules/reference-motif pack\n\
+  --out-dir <dir>          write tf_genes, tf_map, evidence, trace tables and SQLite here\n\
+  --proteins <faa> | --cds <fna>  user protein or CDS FASTA\n\
+  --include-single-domain-fallback  also scan mappings marked fallback\n\
+  --background <A,C,G,T>  base probabilities (default 0.25,0.25,0.25,0.25)\n\
+  --hmmsearch <exe>       HMMER executable (default: manifest or PATH)\n\
+  --blastp <exe>          BLASTP executable (default: manifest or PATH)\n\
+\n\
+TRACE OPTIONS:\n\
+  --tf-genes <tsv>        identified TF catalogue\n\
+  --tf-map <tsv>          TF–motif mapping used for the scan\n\
+  --evidence <tsv>        scan evidence table\n\
+  --motifs <jaspar>       motif library used for the scan\n\
+  --reference-map <tsv>   optional reference TF map (adds reference symbols/families)\n\
+  --pack-version <label>  optional reference-pack label recorded in the trace\n\
+  --out-dir <dir>         write tf_motif_trace, motif_ambiguity, target_candidate_ties\n\
+\n\
 SCAN OPTIONS:\n\
   --promoter-len <bp>     upstream length (default 1000)\n\
   --downstream <bp>       downstream window incl. TSS (default 0; PlantRegMap uses 100)\n\
-  --tf-map <tsv>          TF–motif map (optional; derived from motif names if omitted)\n\
+  --tf-map <tsv>          TF–motif map (required with --tf-genes)\n\
+  --include-single-domain-fallback  also scan mappings marked single_domain_fallback\n\
+  --tf-genes <tsv>        identified species TF catalogue (gene_id, family, status);\n\
+                          enables mapped-only validation of tf-map entries\n\
+\n\
+IDENTIFY-TFS OPTIONS:\n\
+  --proteins <faa>        one representative protein per gene\n\
+  --hmm <hmm>             HMMER3 TF/domain library\n\
+  --family-map <tsv>      hmm_model/family mapping (optional; defaults to model name)\n\
+  --evalue <e>            domain E-value cutoff (default 1e-5)\n\
+  --min-coverage <0..1>   minimum HMM coverage (default 0.5)\n\
   --promoters <fa>        scan a promoter FASTA directly (skip genome/GFF)\n\
   --promoters-out <fa>    export extracted promoters as FASTA\n\
   --pvalue <p>            PWM hit p-value cutoff (default 1e-4)\n\
@@ -105,6 +160,7 @@ SCAN OPTIONS:\n\
   --annotation <tsv>      gene_id/symbol annotation for target symbols\n\
   --user-list <tsv>       user TF–target evidence list to append\n\
   --max-genes <n>         only process the first n genes (testing)\n\
+  --gene-biotype <value>  only scan genes with this GFF gene_biotype\n\
   --one-strand            scan only the plus strand of each promoter\n\
   --both-strands          scan both strands (default)\n\
   --report-json <path>    write a machine-readable diagnostics report\n\
@@ -114,6 +170,7 @@ SCAN OPTIONS:\n\
   --strict                treat warnings as failure (validate)\n\
   -h, --help              show this help\n\
 \n\
+tf-genes columns: gene_id, tf_symbol, family, identification_status, source\n\
 tf-map columns: tf_id, tf_symbol, family, motif_id (one row per TF–motif pair);\n\
 if omitted, tf_id/tf_symbol are taken from the motif header name\n\
 user-list columns: tf, target, evidence_type, evidence_level, method, source, pmid, condition, score, notes"
@@ -158,7 +215,11 @@ fn parse_scan_args(args: &[String]) -> Result<Args> {
             "--gff" => a.gff = Some(PathBuf::from(it.next().context("--gff needs a value")?)),
             "--motifs" => a.motifs = Some(PathBuf::from(it.next().context("--motifs needs a value")?)),
             "--tf-map" => a.tf_map = Some(PathBuf::from(it.next().context("--tf-map needs a value")?)),
+            "--tf-genes" => {
+                a.tf_genes = Some(PathBuf::from(it.next().context("--tf-genes needs a value")?))
+            }
             "--out" => a.out = Some(PathBuf::from(it.next().context("--out needs a value")?)),
+            "--allow-empty-tf-map" => a.allow_empty_tf_map = true,
             "--annotation" => {
                 a.annotation = Some(PathBuf::from(it.next().context("--annotation needs a value")?))
             }
@@ -212,6 +273,14 @@ fn parse_scan_args(args: &[String]) -> Result<Args> {
                         .context("invalid --max-genes")?,
                 )
             }
+            "--gene-biotype" => {
+                let value = it.next().context("--gene-biotype needs a value")?;
+                if value.trim().is_empty() {
+                    bail!("--gene-biotype must be nonempty");
+                }
+                a.gene_biotype = Some(value.to_owned());
+            }
+            "--gene-biotype-from-pack" => a.gene_biotype_from_pack = true,
             "--report-json" => {
                 a.report_json = Some(PathBuf::from(
                     it.next().context("--report-json needs a value")?,
@@ -235,6 +304,7 @@ fn parse_scan_args(args: &[String]) -> Result<Args> {
                     a.threads = Some(n);
                 }
             }
+            "--include-single-domain-fallback" => a.include_single_domain_fallback = true,
             "--strict" => a.strict = true,
             "--one-strand" => a.both_strands = false,
             "--both-strands" => a.both_strands = true,
@@ -253,6 +323,9 @@ fn parse_scan_args(args: &[String]) -> Result<Args> {
     }
     if a.threads.is_some_and(|n| n > 256) {
         bail!("--threads must be between 1 and 256");
+    }
+    if a.gene_biotype_from_pack && a.gene_biotype.is_none() {
+        bail!("--gene-biotype-from-pack requires --gene-biotype");
     }
     Ok(a)
 }
@@ -405,7 +478,23 @@ fn scan_chunk(
                         strand: hit.strand.to_string(),
                         score: Some(hit.score),
                         p_value: Some(hit.p_value),
-                        notes: format!("family={}", tf.family),
+                        notes: {
+                            let mut notes = format!("family={}", tf.family);
+                            if !tf.reference_tf_id.is_empty()
+                                || !tf.mapping_method.is_empty()
+                                || !tf.domain_mode.is_empty()
+                            {
+                                notes.push_str(&format!(";motif_mapping={}", serde_json::json!({
+                                    "reference_tf_id": tf.reference_tf_id,
+                                    "method": tf.mapping_method,
+                                    "domain_mode": tf.domain_mode,
+                                    "extraction_family": tf.extraction_family,
+                                    "extraction_models": tf.extraction_models,
+                                    "domain_count": tf.domain_count,
+                                })));
+                            }
+                            notes
+                        },
                     });
                 }
             }
@@ -540,6 +629,202 @@ fn cmd_validate(raw: &[String]) -> Result<()> {
     Ok(())
 }
 
+fn filter_gene_biotype(
+    mut genes: Vec<gff::GeneModel>,
+    wanted: Option<&str>,
+) -> Vec<gff::GeneModel> {
+    if let Some(wanted) = wanted {
+        genes.retain(|gene| gene.biotype.as_deref() == Some(wanted));
+    }
+    genes
+}
+
+fn apply_gene_biotype_filter(
+    genes: Vec<gff::GeneModel>,
+    wanted: Option<&str>,
+    from_pack_default: bool,
+    report: &mut diagnostics::Report,
+) -> Result<Vec<gff::GeneModel>> {
+    let Some(wanted) = wanted else {
+        return Ok(genes);
+    };
+    let total = genes.len();
+    let with_field = genes.iter().filter(|gene| gene.biotype.is_some()).count();
+    let matched = genes
+        .iter()
+        .filter(|gene| gene.biotype.as_deref() == Some(wanted))
+        .count();
+    if with_field == 0 {
+        let message = format!(
+            "GFF has no gene_biotype attribute, so the gene_biotype={wanted} filter cannot be applied"
+        );
+        if from_pack_default {
+            report.push(
+                diagnostics::Diagnostic::warning(
+                    "GENE_BIOTYPE_FILTER_SKIPPED",
+                    format!(
+                        "{message}; pack default ignored and all {total} gene(s) will be scanned"
+                    ),
+                )
+                .with_suggestion(
+                    "add gene_biotype to the GFF, or pass --gene-biotype explicitly to enforce a target universe",
+                ),
+            );
+            return Ok(genes);
+        }
+        bail!(
+            "{message}; provide a GFF with gene_biotype or remove --gene-biotype"
+        );
+    }
+    if matched == 0 {
+        let available: Vec<_> = genes
+            .iter()
+            .filter_map(|gene| gene.biotype.as_deref())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        if from_pack_default {
+            report.push(
+                diagnostics::Diagnostic::warning(
+                    "GENE_BIOTYPE_FILTER_SKIPPED",
+                    format!(
+                        "no gene has gene_biotype={wanted}; pack default ignored and all {total} gene(s) will be scanned"
+                    ),
+                )
+                .with_context("available", available.join(","))
+                .with_suggestion(
+                    "check the GFF gene_biotype values or pass --gene-biotype explicitly",
+                ),
+            );
+            return Ok(genes);
+        }
+        bail!(
+            "no gene has gene_biotype={wanted}; available gene_biotype values: {}",
+            available.join(",")
+        );
+    }
+    report.info(
+        "GENE_BIOTYPE_FILTER",
+        format!("kept {matched} of {total} gene(s) with gene_biotype={wanted}"),
+    );
+    Ok(filter_gene_biotype(genes, Some(wanted)))
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct MappingFilterStats {
+    total: usize,
+    fallback: usize,
+    retained: usize,
+    excluded: usize,
+}
+
+fn is_single_domain_fallback(tf: &io::TfMotif) -> bool {
+    tf.domain_mode.trim().eq_ignore_ascii_case("single_domain_fallback")
+}
+
+fn filter_scan_mappings(
+    mut tf_map: Vec<io::TfMotif>,
+    include_fallback: bool,
+) -> (Vec<io::TfMotif>, MappingFilterStats) {
+    let total = tf_map.len();
+    let fallback = tf_map.iter().filter(|tf| is_single_domain_fallback(tf)).count();
+    if include_fallback {
+        return (
+            tf_map,
+            MappingFilterStats {
+                total,
+                fallback,
+                retained: total,
+                excluded: 0,
+            },
+        );
+    }
+    tf_map.retain(|tf| !is_single_domain_fallback(tf));
+    let retained = tf_map.len();
+    (
+        tf_map,
+        MappingFilterStats {
+            total,
+            fallback,
+            retained,
+            excluded: total - retained,
+        },
+    )
+}
+
+fn report_mapping_filter(
+    report: &mut diagnostics::Report,
+    stats: MappingFilterStats,
+    include_fallback: bool,
+) {
+    report.info(
+        "TFMAP_DOMAIN_FILTER",
+        format!(
+            "tf-map rows total={}, single_domain_fallback={}, retained={}, excluded={}{}",
+            stats.total,
+            stats.fallback,
+            stats.retained,
+            stats.excluded,
+            if include_fallback {
+                " (fallback inclusion requested)"
+            } else {
+                " (use --include-single-domain-fallback to retain fallback rows)"
+            }
+        ),
+    );
+}
+
+fn validate_tf_identity(
+    tf_map: &[io::TfMotif],
+    tf_genes: Option<&Path>,
+    report: &mut diagnostics::Report,
+) -> Result<()> {
+    let Some(path) = tf_genes else {
+        return Ok(());
+    };
+    let genes = if tf_map.is_empty() { io::read_tf_genes_allow_empty(path)? } else { io::read_tf_genes(path)? };
+    let mut unknown = Vec::new();
+    let mut not_identified = Vec::new();
+    for tf in tf_map {
+        match genes.get(&tf.tf_id) {
+            None => unknown.push(tf.tf_id.clone()),
+            Some(gene) if !gene.is_identified() => {
+                not_identified.push(format!("{} ({})", tf.tf_id, gene.status))
+            }
+            Some(_) => {}
+        }
+    }
+    unknown.sort();
+    unknown.dedup();
+    not_identified.sort();
+    not_identified.dedup();
+    if !unknown.is_empty() {
+        bail!(
+            "tf-map references {} TF gene(s) absent from --tf-genes: {}{}",
+            unknown.len(),
+            unknown.iter().take(10).cloned().collect::<Vec<_>>().join(", "),
+            if unknown.len() > 10 { ", ..." } else { "" }
+        );
+    }
+    if !not_identified.is_empty() {
+        bail!(
+            "tf-map references TF gene(s) not marked identified: {}{}",
+            not_identified.iter().take(10).cloned().collect::<Vec<_>>().join(", "),
+            if not_identified.len() > 10 { ", ..." } else { "" }
+        );
+    }
+    report.add_input("tf_genes", path);
+    report.info(
+        "TF_IDENTITY_SUMMARY",
+        format!(
+            "mapped {} TF–motif row(s) to {} identified TF gene(s)",
+            tf_map.len(),
+            genes.values().filter(|gene| gene.is_identified()).count()
+        ),
+    );
+    Ok(())
+}
+
 fn run_validate(
     args: &Args,
     report: &mut diagnostics::Report,
@@ -569,17 +854,33 @@ fn run_validate(
         any = true;
         report.add_input("tf_map", path);
         let tf_map = io::read_tf_map(path)?;
-        if let Some(motifs) = &motifs {
-            diagnostics::review_tf_map(&tf_map, motifs, path, report);
-        } else {
+        let (tf_map, filter) =
+            filter_scan_mappings(tf_map, args.include_single_domain_fallback);
+        report_mapping_filter(report, filter, args.include_single_domain_fallback);
+        if filter.retained == 0 {
             report.push(
-                diagnostics::Diagnostic::warning(
-                    "TFMAP_WITHOUT_MOTIFS",
-                    "tf-map provided without --motifs; motif matching was not checked",
+                diagnostics::Diagnostic::error(
+                    "TFMAP_ALL_FALLBACK_FILTERED",
+                    "all tf-map rows are single_domain_fallback; validation fails because scan would have no eligible mappings (use --include-single-domain-fallback to retain them)",
                 )
                 .with_file(path),
             );
+        } else {
+            validate_tf_identity(&tf_map, args.tf_genes.as_deref(), report)?;
+            if let Some(motifs) = &motifs {
+                diagnostics::review_tf_map(&tf_map, motifs, path, report);
+            } else {
+                report.push(
+                    diagnostics::Diagnostic::warning(
+                        "TFMAP_WITHOUT_MOTIFS",
+                        "tf-map provided without --motifs; motif matching was not checked",
+                    )
+                    .with_file(path),
+                );
+            }
         }
+    } else if args.tf_genes.is_some() {
+        bail!("--tf-genes requires --tf-map (motif-header auto mapping has no gene identities)");
     }
 
     let annotation = if let Some(path) = &args.annotation {
@@ -637,6 +938,12 @@ fn run_validate(
         let (genes, gff_stats) = gff::read_gff_with_stats(gff_path)?;
         diagnostics::review_gff(&genes, &gff_stats, gff_path, report);
         diagnostics::review_chromosomes(&genes, &fa, gff_path, genome_path, report);
+        let genes = apply_gene_biotype_filter(
+            genes,
+            args.gene_biotype.as_deref(),
+            args.gene_biotype_from_pack,
+            report,
+        )?;
         let mut promoters = Vec::new();
         let mut skipped = 0usize;
         for gene in &genes {
@@ -742,7 +1049,11 @@ fn run_scan(
     eprintln!("reading motifs: {}", motifs_path.display());
     let motifs = pwm::read_jaspar(&motifs_path)?;
     diagnostics::review_motifs(&motifs, &motifs_path, report);
-    let tf_map: Vec<io::TfMotif> = match &args.tf_map {
+    if args.tf_genes.is_some() && args.tf_map.is_none() {
+        bail!("--tf-genes requires --tf-map (motif-header auto mapping has no gene identities)");
+    }
+    let mut tf_map: Vec<io::TfMotif> = match &args.tf_map {
+        Some(path) if args.allow_empty_tf_map => io::read_tf_map_allow_empty(path)?,
         Some(path) => io::read_tf_map(path)?,
         None => {
             eprintln!("no --tf-map given; deriving TF IDs from motif names");
@@ -759,14 +1070,35 @@ fn run_scan(
                         tf_symbol: symbol,
                         family: String::new(),
                         motif_id: m.id.clone(),
+                        reference_tf_id: String::new(),
+                        mapping_method: String::new(),
+                        ..Default::default()
                     }
                 })
                 .collect()
         }
     };
     if let Some(path) = &args.tf_map {
+        let (filtered, filter) =
+            filter_scan_mappings(tf_map, args.include_single_domain_fallback);
+        tf_map = filtered;
+        report_mapping_filter(report, filter, args.include_single_domain_fallback);
+        if filter.retained == 0 && !(args.allow_empty_tf_map && filter.total == 0) {
+            report.push(
+                diagnostics::Diagnostic::error(
+                    "TFMAP_ALL_FALLBACK_FILTERED",
+                    "all tf-map rows are single_domain_fallback; rerun with --include-single-domain-fallback to scan them",
+                )
+                .with_file(path),
+            );
+            bail!(
+                "all {} tf-map row(s) are single_domain_fallback; rerun with --include-single-domain-fallback to scan them",
+                filter.total
+            );
+        }
         report.add_input("tf_map", path);
         diagnostics::review_tf_map(&tf_map, &motifs, path, report);
+        validate_tf_identity(&tf_map, args.tf_genes.as_deref(), report)?;
     } else {
         report.info(
             "TFMAP_AUTO",
@@ -839,6 +1171,12 @@ fn run_scan(
         if let Some(path) = &args.annotation {
             diagnostics::review_annotation(&annotation, &genes, path, report);
         }
+        let genes = apply_gene_biotype_filter(
+            genes,
+            args.gene_biotype.as_deref(),
+            args.gene_biotype_from_pack,
+            report,
+        )?;
         progress.write(
             "extracting_promoters",
             "running",
@@ -914,7 +1252,7 @@ fn run_scan(
         }
         motif_to_tfs.entry(tf.motif_id.clone()).or_default().push(tf);
     }
-    if motif_to_tfs.is_empty() {
+    if motif_to_tfs.is_empty() && !(args.allow_empty_tf_map && tf_map.is_empty()) {
         bail!("no TF–motif rows matched the motif library");
     }
     if missing_motif > 0 {
@@ -1386,6 +1724,218 @@ fn cmd_validate_db(args: &[String]) -> Result<()> {
     }
     println!("valid TF-target prior database");
     Ok(())
+}
+
+fn cmd_classify_tfs(args: &[String]) -> Result<()> {
+    use regutrace_core::{hmmer, tf_classification};
+
+    let opts = parse_options(args)?;
+    for option in opts.keys() {
+        if !matches!(option.as_str(), "--domtblout" | "--rules" | "--out") {
+            bail!("unknown option: {option}");
+        }
+    }
+    let domtblout = Path::new(opts.get("--domtblout").context("missing --domtblout")?);
+    let rules = Path::new(opts.get("--rules").context("missing --rules")?);
+    let out = Path::new(opts.get("--out").context("missing --out")?);
+    for input in ["--domtblout", "--rules"] {
+        if same_path(&opts[input], &opts["--out"]) {
+            bail!("{input} and --out must be different files");
+        }
+    }
+    let pack: tf_classification::RulePack = serde_json::from_reader(fasta::open_reader(rules)?)
+        .with_context(|| format!("read TF rules {}", rules.display()))?;
+    let hits = hmmer::read_hmmsearch_domains(BufReader::new(fasta::open_reader(domtblout)?))?;
+    let (classifications, unknown_models) = tf_classification::classify(&pack, &hits)?;
+
+    // Keep protein identities until a separate gene mapping step can validate them.
+    let tmp = temp_output_path(out);
+    let result = (|| -> Result<()> {
+        let mut writer = WriterBuilder::new().delimiter(b'\t').from_path(&tmp)?;
+        writer.write_record(["protein_id", "family", "subfamily", "rules_version", "domains_json"])?;
+        for classification in &classifications {
+            let domains = serde_json::to_string(&classification.domains)?;
+            for rule in &classification.families {
+                writer.write_record([
+                    classification.protein_id,
+                    &rule.family,
+                    &rule.subfamily,
+                    &pack.version,
+                    &domains,
+                ])?;
+            }
+        }
+        writer.flush()?;
+        drop(writer);
+        publish_temp(&tmp, out)
+    })();
+    if result.is_err() {
+        cleanup_output_temp(&tmp);
+    }
+    result?;
+    if !unknown_models.is_empty() {
+        eprintln!("models absent from the rule pack: {}", unknown_models.join(", "));
+    }
+    println!("classified {} protein(s)", classifications.len());
+    Ok(())
+}
+
+fn cmd_identify_tfs(args: &[String]) -> Result<()> {
+    let opts = parse_options(args)?;
+    let proteins = opts.get("--proteins").context("missing --proteins")?;
+    let hmm = opts.get("--hmm").context("missing --hmm")?;
+    let out = opts.get("--out").context("missing --out")?;
+    let evalue = opts
+        .get("--evalue")
+        .map(|value| value.parse::<f64>())
+        .transpose()
+        .context("--evalue must be a number")?
+        .unwrap_or(1e-5);
+    if !evalue.is_finite() || evalue <= 0.0 {
+        bail!("--evalue must be a positive finite number");
+    }
+    let min_coverage = opts
+        .get("--min-coverage")
+        .map(|value| value.parse::<f64>())
+        .transpose()
+        .context("--min-coverage must be a number")?
+        .unwrap_or(0.5);
+    if !(0.0..=1.0).contains(&min_coverage) {
+        bail!("--min-coverage must be between 0 and 1");
+    }
+    let family_map = match opts.get("--family-map") {
+        Some(path) => read_family_map(Path::new(path))?,
+        None => HashMap::new(),
+    };
+
+    let fa = fasta::read_fasta(Path::new(proteins))?;
+    if fa.order.is_empty() {
+        bail!("protein FASTA is empty: {proteins}");
+    }
+    let seqs: Vec<Seq> = fa
+        .order
+        .iter()
+        .filter_map(|name| {
+            fa.seqs.get(name).map(|seq| {
+                Seq::from_amino(name.clone(), String::new(), &String::from_utf8_lossy(seq))
+            })
+        })
+        .collect();
+    let annotator = HmmAnnotator::from_hmm_file(hmm)
+        .map_err(|err| anyhow::anyhow!("read HMM database {hmm}: {err}"))?
+        .with_cutoff(Cutoff::Evalue(evalue));
+    let hits = annotator.search(&seqs);
+
+    let mut best: HashMap<String, (String, f64, f64)> = HashMap::new();
+    for hit in hits {
+        let coverage = if hit.model_len == 0 {
+            0.0
+        } else {
+            (hit.hmm_to - hit.hmm_from + 1).max(0) as f64 / hit.model_len as f64
+        };
+        if hit.best_dom_evalue > evalue || coverage < min_coverage {
+            continue;
+        }
+        let candidate = (hit.query_name.clone(), hit.best_dom_evalue, coverage);
+        match best.get(&hit.target_name) {
+            Some((_, old_evalue, old_coverage))
+                if (*old_evalue < candidate.1)
+                    || (*old_evalue == candidate.1 && *old_coverage >= candidate.2) => {}
+            _ => {
+                best.insert(hit.target_name, candidate);
+            }
+        }
+    }
+    if best.is_empty() {
+        bail!("no TF-domain hit passed --evalue {evalue} and --min-coverage {min_coverage}");
+    }
+
+    let identified = best.len();
+    let tmp = temp_output_path(Path::new(out));
+    let result = (|| -> Result<()> {
+        let mut writer = WriterBuilder::new()
+            .delimiter(b'\t')
+            .from_path(&tmp)
+            .with_context(|| format!("create {}", tmp.display()))?;
+        writer.write_record([
+            "gene_id",
+            "tf_symbol",
+            "family",
+            "identification_status",
+            "hmm_model",
+            "evalue",
+            "coverage",
+            "source",
+        ])?;
+        let mut genes: Vec<_> = best.into_iter().collect();
+        genes.sort_by(|a, b| a.0.cmp(&b.0));
+        for (gene, (model, hit_evalue, coverage)) in genes {
+            let family = family_map.get(&model).cloned().unwrap_or_else(|| model.clone());
+            writer.write_record([
+                gene.as_str(),
+                gene.as_str(),
+                family.as_str(),
+                "identified",
+                model.as_str(),
+                &format!("{hit_evalue:.6e}"),
+                &format!("{coverage:.3}"),
+                "regutrace-identify-tfs",
+            ])?;
+        }
+        writer.flush()?;
+        drop(writer);
+        Ok(())
+    })();
+    if let Err(err) = result {
+        cleanup_output_temp(&tmp);
+        return Err(err);
+    }
+    if let Err(err) = publish_temp(&tmp, Path::new(out)) {
+        cleanup_output_temp(&tmp);
+        return Err(err);
+    }
+    println!("identified {identified} TF gene(s) -> {out}");
+    Ok(())
+}
+
+fn read_family_map(path: &Path) -> Result<HashMap<String, String>> {
+    let reader = fasta::open_reader(path)?;
+    let mut rdr = ReaderBuilder::new()
+        .delimiter(b'\t')
+        .flexible(true)
+        .from_reader(reader);
+    let headers = rdr
+        .headers()
+        .with_context(|| format!("read header {}", path.display()))?
+        .clone();
+    let model = headers
+        .iter()
+        .position(|header| {
+            matches!(
+                header.trim().to_ascii_lowercase().as_str(),
+                "hmm_model" | "model" | "hmm" | "name"
+            )
+        })
+        .with_context(|| format!("family map missing model column: {}", path.display()))?;
+    let family = headers
+        .iter()
+        .position(|header| {
+            matches!(
+                header.trim().to_ascii_lowercase().as_str(),
+                "family" | "tf_family"
+            )
+        })
+        .with_context(|| format!("family map missing family column: {}", path.display()))?;
+    let mut out = HashMap::new();
+    for rec in rdr.records() {
+        let rec = rec?;
+        let model = rec.get(model).unwrap_or("").trim();
+        let family = rec.get(family).unwrap_or("").trim();
+        if !model.is_empty() && !family.is_empty() {
+            out.insert(model.to_string(), family.to_string());
+        }
+    }
+    Ok(out)
 }
 
 fn cmd_prior(args: &[String]) -> Result<()> {
@@ -2108,11 +2658,17 @@ fn main() {
         }
         Some("scan") => cmd_scan(&args[1..]),
         Some("validate") => cmd_validate(&args[1..]),
+        Some("pipeline") => pipeline::run(&args[1..]),
+        Some("trace") => trace::run(&args[1..]),
         Some("import") => cmd_import(&args[1..]),
         Some("export") => cmd_export(&args[1..]),
         Some("stats") => cmd_stats(&args[1..]),
         Some("convert") => cmd_convert(&args[1..]),
         Some("prior") => cmd_prior(&args[1..]),
+        Some("identify-plant-tfs") => plant_tfs::run(&args[1..]),
+        Some("map-tf-motifs") => motif_transfer::run(&args[1..]),
+        Some("classify-tfs") => cmd_classify_tfs(&args[1..]),
+        Some("identify-tfs") => cmd_identify_tfs(&args[1..]),
         Some("validate-db") => cmd_validate_db(&args[1..]),
         Some(other) => Err(anyhow::anyhow!("unknown command: {other}")),
     };
@@ -2323,6 +2879,286 @@ TF1\tG2\t\t\t\t \n",
         ]);
         assert!(result.is_err());
         assert_eq!(std::fs::read_to_string(&out).unwrap(), "keep-me");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tf_genes_gate_rejects_unknown_and_ambiguous() {
+        let dir = std::env::temp_dir().join(format!(
+            "regutrace-tf-gate-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let genes = dir.join("tf_genes.tsv");
+        std::fs::write(
+            &genes,
+            "gene_id\ttf_symbol\tfamily\tidentification_status\n\
+             AT1G01010\tNAC001\tNAC\tidentified\n\
+             AT1G01020\tTEST\t\tambiguous\n",
+        )
+        .unwrap();
+        let mut report = diagnostics::Report::new("scan");
+        let map = vec![io::TfMotif {
+            tf_id: "AT1G01010".into(),
+            tf_symbol: "NAC001".into(),
+            family: "NAC".into(),
+            motif_id: "MA0001.1".into(),
+            reference_tf_id: String::new(),
+            mapping_method: String::new(),
+            ..Default::default()
+        }];
+        validate_tf_identity(&map, Some(&genes), &mut report).unwrap();
+
+        let unknown = vec![io::TfMotif {
+            tf_id: "AT9G99999".into(),
+            tf_symbol: "UNKNOWN".into(),
+            family: String::new(),
+            motif_id: "MA0001.1".into(),
+            reference_tf_id: String::new(),
+            mapping_method: String::new(),
+            ..Default::default()
+        }];
+        let err = validate_tf_identity(&unknown, Some(&genes), &mut report).unwrap_err();
+        assert!(err.to_string().contains("absent from --tf-genes"), "{err}");
+
+        let ambiguous = vec![io::TfMotif {
+            tf_id: "AT1G01020".into(),
+            tf_symbol: "TEST".into(),
+            family: String::new(),
+            motif_id: "MA0001.1".into(),
+            reference_tf_id: String::new(),
+            mapping_method: String::new(),
+            ..Default::default()
+        }];
+        let err = validate_tf_identity(&ambiguous, Some(&genes), &mut report).unwrap_err();
+        assert!(err.to_string().contains("not marked identified"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn mapping_row(tf_id: &str, motif_id: &str, domain_mode: &str) -> io::TfMotif {
+        io::TfMotif {
+            tf_id: tf_id.to_owned(),
+            tf_symbol: tf_id.to_owned(),
+            family: "bZIP".to_owned(),
+            motif_id: motif_id.to_owned(),
+            reference_tf_id: tf_id.to_owned(),
+            mapping_method: "reciprocal_dbd_similarity".to_owned(),
+            domain_mode: domain_mode.to_owned(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn gene_biotype_filter_keeps_only_requested_models() {
+        let gene = |id: &str, biotype: Option<&str>| gff::GeneModel {
+            gene_id: id.to_owned(),
+            symbol: id.to_owned(),
+            chrom: "Chr1".to_owned(),
+            start: 1,
+            end: 100,
+            strand: '+',
+            transcript_id: None,
+            tss: 1,
+            biotype: biotype.map(str::to_owned),
+        };
+        let genes = vec![
+            gene("coding", Some("protein_coding")),
+            gene("ncrna", Some("ncRNA")),
+            gene("inferred", None),
+        ];
+        let filtered = filter_gene_biotype(genes.clone(), Some("protein_coding"));
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].gene_id, "coding");
+        assert_eq!(filter_gene_biotype(genes, None).len(), 3);
+    }
+
+    #[test]
+    fn mapping_filter_keeps_old_maps_without_labels() {
+        let (map, stats) = filter_scan_mappings(
+            vec![mapping_row("YEL009C", "MA0303.3", "")],
+            false,
+        );
+        assert_eq!(map.len(), 1);
+        assert_eq!(stats.total, 1);
+        assert_eq!(stats.fallback, 0);
+        assert_eq!(stats.retained, 1);
+        assert_eq!(stats.excluded, 0);
+    }
+
+    #[test]
+    fn mapping_filter_defaults_to_full_architecture_only() {
+        let rows = vec![
+            mapping_row("TF1", "MA1", "full_architecture"),
+            mapping_row("TF2", "MA2", "single_domain_fallback"),
+            mapping_row("TF3", "MA3", "external_alignment"),
+        ];
+        let (map, stats) = filter_scan_mappings(rows.clone(), false);
+        assert_eq!(map.len(), 2);
+        assert_eq!(stats.total, 3);
+        assert_eq!(stats.fallback, 1);
+        assert_eq!(stats.retained, 2);
+        assert_eq!(stats.excluded, 1);
+
+        let (all, stats) = filter_scan_mappings(rows, true);
+        assert_eq!(all.len(), 3);
+        assert_eq!(stats.retained, 3);
+        assert_eq!(stats.excluded, 0);
+        assert_eq!(stats.fallback, 1);
+    }
+
+    #[test]
+    fn mapping_filter_reports_all_fallback_as_zero_retained() {
+        let (map, stats) = filter_scan_mappings(
+            vec![
+                mapping_row("TF1", "MA1", "single_domain_fallback"),
+                mapping_row("TF2", "MA2", " Single_Domain_Fallback "),
+            ],
+            false,
+        );
+        assert!(map.is_empty());
+        assert_eq!(stats.total, 2);
+        assert_eq!(stats.fallback, 2);
+        assert_eq!(stats.retained, 0);
+        assert_eq!(stats.excluded, 2);
+    }
+
+    #[test]
+    fn mapping_filter_keeps_ties_and_multiple_motifs_per_gene() {
+        let rows = vec![
+            mapping_row("TF1", "MA1", "full_architecture"),
+            mapping_row("TF1", "MA2", "full_architecture"),
+            mapping_row("TF2", "MA1", "full_architecture"),
+        ];
+        let (map, stats) = filter_scan_mappings(rows, false);
+        assert_eq!(map.len(), 3);
+        assert_eq!(stats.excluded, 0);
+    }
+
+    #[test]
+    fn all_fallback_map_controls_validate_and_scan() {
+        let dir = std::env::temp_dir().join(format!(
+            "regutrace-fallback-gate-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let motifs = dir.join("motifs.jaspar");
+        std::fs::write(
+            &motifs,
+            ">MA0001.1 TEST
+A  [ 10 0 0 0 ]
+C  [ 0 10 0 0 ]
+G  [ 0 0 10 0 ]
+T  [ 0 0 0 10 ]
+",
+        )
+        .unwrap();
+        let promoters = dir.join("promoters.fa");
+        std::fs::write(&promoters, ">G1
+ACGTACGTACGT
+").unwrap();
+        let map = dir.join("map.tsv");
+        std::fs::write(
+            &map,
+            "tf_id	tf_symbol	family	motif_id	reference_tf_id	mapping_method	domain_mode
+             TF1	TF1	bZIP	MA0001.1	TF1	reciprocal_dbd_similarity	single_domain_fallback
+",
+        )
+        .unwrap();
+        let out = dir.join("out.tsv");
+        let validate = |include: bool| {
+            let mut args = vec![
+                "--promoters".to_owned(),
+                promoters.to_string_lossy().into_owned(),
+                "--motifs".to_owned(),
+                motifs.to_string_lossy().into_owned(),
+                "--tf-map".to_owned(),
+                map.to_string_lossy().into_owned(),
+            ];
+            if include {
+                args.push("--include-single-domain-fallback".to_owned());
+            }
+            cmd_validate(&args)
+        };
+        let scan = |include: bool| {
+            let mut args = vec![
+                "--promoters".to_owned(),
+                promoters.to_string_lossy().into_owned(),
+                "--motifs".to_owned(),
+                motifs.to_string_lossy().into_owned(),
+                "--tf-map".to_owned(),
+                map.to_string_lossy().into_owned(),
+                "--out".to_owned(),
+                out.to_string_lossy().into_owned(),
+            ];
+            if include {
+                args.push("--include-single-domain-fallback".to_owned());
+            }
+            cmd_scan(&args)
+        };
+        assert!(validate(false).is_err(), "all-fallback validate must fail");
+        assert!(scan(false).is_err(), "all-fallback scan must fail");
+        assert!(validate(true).is_ok(), "included fallback validate must pass");
+        assert!(scan(true).is_ok(), "included fallback scan must pass");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn converted_sqlite_passes_validate_db_and_prior() {
+        let dir = std::env::temp_dir().join(format!(
+            "regutrace-convert-db-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tsv = dir.join("evidence.tsv");
+        std::fs::write(
+            &tsv,
+            "tf_id	tf_symbol	target_id	target_symbol	evidence_type	evidence_level	method	source	pmid	condition	promoter_start	promoter_end	motif_id	hit_start	hit_end	strand	score	p_value	notes
+             TF1	TF1	G1	G1	prediction_motif	D	jaspar_pwm	promoter_scan					MA1			+	1	1e-5	family=bZIP;motif_mapping={\"domain_mode\":\"full_architecture\"}
+",
+        )
+        .unwrap();
+        let db = dir.join("evidence.db");
+        assert!(cmd_convert(&[
+            "--input".to_owned(),
+            tsv.to_string_lossy().into_owned(),
+            "--out".to_owned(),
+            db.to_string_lossy().into_owned(),
+            "--format".to_owned(),
+            "sqlite".to_owned(),
+        ])
+        .is_ok());
+        assert!(cmd_validate_db(&[
+            "--db".to_owned(),
+            db.to_string_lossy().into_owned(),
+        ])
+        .is_ok());
+        let targets = dir.join("targets.txt");
+        std::fs::write(&targets, "G1
+").unwrap();
+        let prior = dir.join("prior.tsv");
+        assert!(cmd_prior(&[
+            "--db".to_owned(),
+            db.to_string_lossy().into_owned(),
+            "--targets".to_owned(),
+            targets.to_string_lossy().into_owned(),
+            "--out".to_owned(),
+            prior.to_string_lossy().into_owned(),
+        ])
+        .is_ok());
+        let text = std::fs::read_to_string(&prior).unwrap();
+        assert!(text.contains("TF1"), "{text}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -1,5 +1,6 @@
 //! JASPAR PFM/PWM reader and log-odds conversion.
 
+use std::collections::HashSet;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 
@@ -95,9 +96,11 @@ fn finalize(id: String, name: String, rows: [Vec<f64>; 4]) -> Result<Pwm> {
 }
 
 /// Read a JASPAR-style PFM/PWM text file (multiple records allowed).
+/// Motif IDs must be unique.
 pub fn read_jaspar(path: &Path) -> Result<Vec<Pwm>> {
     let reader = BufReader::new(open_reader(path)?);
     let mut out = Vec::new();
+    let mut seen_ids = HashSet::new();
     let mut id: Option<String> = None;
     let mut name = String::new();
     let mut rows: [Vec<f64>; 4] = Default::default();
@@ -116,6 +119,12 @@ pub fn read_jaspar(path: &Path) -> Result<Vec<Pwm>> {
             let next_id = parts.next().unwrap_or("").to_string();
             if next_id.is_empty() {
                 bail!("motif header without ID at line {}", lineno + 1);
+            }
+            if !seen_ids.insert(next_id.clone()) {
+                bail!(
+                    "duplicate motif ID {next_id} at line {}; motif IDs must be unique",
+                    lineno + 1
+                );
             }
             id = Some(next_id);
             name = parts.collect::<Vec<_>>().join(" ");
@@ -287,6 +296,30 @@ mod tests {
         for v in col {
             assert!((v - 0.25).abs() < 1e-12, "v={v}");
         }
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn rejects_duplicate_motif_ids() {
+        let path = std::env::temp_dir().join(format!(
+            "regutrace_pwm_duplicate_{}.txt",
+            std::process::id()
+        ));
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            writeln!(f, ">M1 FIRST").unwrap();
+            writeln!(f, "A [ 10 ]").unwrap();
+            writeln!(f, "C [ 0 ]").unwrap();
+            writeln!(f, "G [ 0 ]").unwrap();
+            writeln!(f, "T [ 0 ]").unwrap();
+            writeln!(f, ">M1 SECOND").unwrap();
+            writeln!(f, "A [ 0 ]").unwrap();
+            writeln!(f, "C [ 10 ]").unwrap();
+            writeln!(f, "G [ 0 ]").unwrap();
+            writeln!(f, "T [ 0 ]").unwrap();
+        }
+        let err = read_jaspar(&path).unwrap_err().to_string();
+        assert!(err.contains("duplicate motif ID M1"), "{err}");
         let _ = std::fs::remove_file(path);
     }
 

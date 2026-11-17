@@ -108,6 +108,7 @@ are warnings, emitting `STRICT_WARNINGS`.
 | code | severity | meaning |
 |---|---|---|
 | `ANNOTATION_COVERAGE` | info | genes with a symbol in the annotation table |
+| `ANNOTATION_ID_MISMATCH` | error | annotation keys have zero overlap with GFF gene IDs; examples and AI-assistant mapping guidance are included |
 | `ANNOTATION_NOT_CHECKED` | info | annotation coverage needs gene models |
 | `USER_EVIDENCE_SUMMARY` | info | rows by evidence level/type |
 | `USER_EVIDENCE_EMPTY` | warning | user evidence list is empty |

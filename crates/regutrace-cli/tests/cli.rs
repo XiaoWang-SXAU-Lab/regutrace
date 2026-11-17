@@ -369,3 +369,207 @@ AT1G00010\tG2\tpoint_validation_emsa\tA\tEMSA\tPMID:123\t123\n",
     assert!(exported.contains("point_validation_emsa"), "{exported}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn cds_only_gff_without_biotype_respects_pack_filter_policy() {
+    let dir = std::env::temp_dir().join(format!(
+        "regutrace_cli_biotype_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let genome_path = dir.join("genome.fa");
+    write(&genome_path, &format!(">Chr1\n{}\n", "A".repeat(2000)));
+
+    // CDS-only annotation: no gene/mRNA features and no gene_biotype attr.
+    let gff_path = dir.join("cds-only.gff3");
+    write(
+        &gff_path,
+        "##gff-version 3\n\
+Chr1\ttest\tCDS\t201\t400\t.\t+\t0\tParent=geneA\n\
+Chr1\ttest\tCDS\t601\t800\t.\t+\t0\tParent=geneB\n",
+    );
+
+    let motif_path = dir.join("motifs.txt");
+    write(
+        &motif_path,
+        ">MA_TEST.1 ALL_A\n\
+A [ 10 10 10 10 ]\n\
+C [ 0 0 0 0 ]\n\
+G [ 0 0 0 0 ]\n\
+T [ 0 0 0 0 ]\n",
+    );
+
+    let bin = env!("CARGO_BIN_EXE_regutrace");
+    let explicit_out = dir.join("explicit.tsv");
+    let explicit = Command::new(bin)
+        .args([
+            "scan",
+            "--genome",
+            genome_path.to_str().unwrap(),
+            "--gff",
+            gff_path.to_str().unwrap(),
+            "--motifs",
+            motif_path.to_str().unwrap(),
+            "--gene-biotype",
+            "protein_coding",
+            "--promoter-len",
+            "100",
+            "--pvalue",
+            "1",
+            "--out",
+            explicit_out.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!explicit.status.success());
+    let stderr = String::from_utf8_lossy(&explicit.stderr);
+    assert!(stderr.contains("GFF has no gene_biotype"), "{stderr}");
+    assert!(stderr.contains("provide a GFF with gene_biotype"), "{stderr}");
+
+    let pack_out = dir.join("pack-default.tsv");
+    let pack_report = dir.join("pack-default-report.json");
+    let pack = Command::new(bin)
+        .args([
+            "scan",
+            "--genome",
+            genome_path.to_str().unwrap(),
+            "--gff",
+            gff_path.to_str().unwrap(),
+            "--motifs",
+            motif_path.to_str().unwrap(),
+            "--gene-biotype",
+            "protein_coding",
+            "--gene-biotype-from-pack",
+            "--promoter-len",
+            "100",
+            "--pvalue",
+            "1",
+            "--out",
+            pack_out.to_str().unwrap(),
+            "--report-json",
+            pack_report.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        pack.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&pack.stderr)
+    );
+    let text = std::fs::read_to_string(&pack_out).unwrap();
+    assert!(text.contains("geneA"), "{text}");
+    assert!(text.contains("geneB"), "{text}");
+    let report: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&pack_report).unwrap()).unwrap();
+    assert!(
+        report["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d["code"] == "GENE_BIOTYPE_FILTER_SKIPPED"),
+        "{report}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn cli_trace_outputs() {
+    let dir = std::env::temp_dir().join(format!(
+        "regutrace_trace_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let genes = dir.join("tf_genes.tsv");
+    write(
+        &genes,
+        "gene_id\ttf_symbol\tfamily\tidentification_status\tsource\n\
+TF1\tTF1\tF\tidentified\ttest\n\
+TF2\tTF2\tF\tidentified\ttest\n",
+    );
+    let map = dir.join("tf_map.tsv");
+    write(
+        &map,
+        "tf_id\ttf_symbol\tfamily\tmotif_id\treference_tf_id\tmapping_method\tdomain_mode\textraction_family\textraction_models\tdomain_count\n\
+TF1\tTF1\tF\tMA1\tR1\treciprocal_dbd_similarity\tfull_architecture\tF\tMODEL\t1\n\
+TF2\tTF2\tF\tMA1\tR1\treciprocal_dbd_tied_candidate\tfull_architecture\tF\tMODEL\t1\n",
+    );
+    let reference = dir.join("reference-map.tsv");
+    write(
+        &reference,
+        "tf_id\ttf_symbol\ttf_family\tmotif_id\n\
+R1\tREF1\tF\tMA1\n",
+    );
+    let motifs = dir.join("motifs.txt");
+    write(
+        &motifs,
+        ">MA1 MOTIF ONE\nA [ 10 0 ]\nC [ 0 10 ]\nG [ 0 0 ]\nT [ 0 0 ]\n",
+    );
+    let evidence = dir.join("evidence.tsv");
+    write(
+        &evidence,
+        "tf_id\ttf_symbol\ttarget_id\ttarget_symbol\tevidence_type\tevidence_level\tmethod\tsource\tpmid\tcondition\tpromoter_start\tpromoter_end\tmotif_id\thit_start\thit_end\tstrand\tscore\tp_value\tnotes\n\
+TF1\tTF1\tG1\tGENE1\tprediction_motif\tD\tjaspar_pwm\tpromoter_scan\t\t\t100\t200\tMA1\t10\t20\t+\t10\t1e-5\t\n\
+TF2\tTF2\tG1\tGENE1\tprediction_motif\tD\tjaspar_pwm\tpromoter_scan\t\t\t100\t200\tMA1\t10\t20\t+\t10\t1e-5\t\n\
+TF1\tTF1\tG2\tGENE2\tprediction_motif\tD\tjaspar_pwm\tpromoter_scan\t\t\t300\t400\tMA1\t30\t40\t+\t8\t1e-4\t\n",
+    );
+    let out = dir.join("trace");
+    let bin = env!("CARGO_BIN_EXE_regutrace");
+    let result = Command::new(bin)
+        .args([
+            "trace",
+            "--tf-genes",
+            genes.to_str().unwrap(),
+            "--tf-map",
+            map.to_str().unwrap(),
+            "--evidence",
+            evidence.to_str().unwrap(),
+            "--motifs",
+            motifs.to_str().unwrap(),
+            "--reference-map",
+            reference.to_str().unwrap(),
+            "--pack-version",
+            "test-pack",
+            "--out-dir",
+            out.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+
+    let trace = std::fs::read_to_string(out.join("tf_motif_trace.tsv")).unwrap();
+    assert!(trace.contains("MOTIF ONE"), "{trace}");
+    assert!(trace.contains("REF1"), "{trace}");
+    assert!(trace.contains("test-pack"), "{trace}");
+    let tf2 = trace.lines().find(|line| line.starts_with("TF2\t")).unwrap();
+    assert!(tf2.contains("reciprocal_dbd_tied_candidate"), "{tf2}");
+    assert!(tf2.contains("\ttrue\t"), "{tf2}");
+    assert!(tf2.contains("\t2\t"), "{tf2}");
+
+    let ambiguity = std::fs::read_to_string(out.join("motif_ambiguity.tsv")).unwrap();
+    assert!(ambiguity.contains("MA1"), "{ambiguity}");
+    assert!(ambiguity.contains("TF1;TF2"), "{ambiguity}");
+    assert!(ambiguity.contains("REF1"), "{ambiguity}");
+
+    let ties = std::fs::read_to_string(out.join("target_candidate_ties.tsv")).unwrap();
+    assert!(ties.contains("G1"), "{ties}");
+    assert!(ties.contains("TF1;TF2"), "{ties}");
+    assert!(ties.contains("GENE1"), "{ties}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

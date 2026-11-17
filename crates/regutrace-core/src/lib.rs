@@ -5,8 +5,10 @@
 pub mod diagnostics;
 pub mod fasta;
 pub mod gff;
+pub mod hmmer;
 pub mod io;
 pub mod promoter;
 pub mod pwm;
 pub mod scan;
 pub mod store;
+pub mod tf_classification;

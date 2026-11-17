@@ -693,18 +693,51 @@ pub fn review_annotation(
     } else {
         0.0
     };
-    report.push(
-        Diagnostic::info(
-            "ANNOTATION_COVERAGE",
-            format!(
-                "{} annotation entries; {genes_with_symbol}/{} genes have a symbol ({coverage:.1}%)",
-                annotation.len(),
-                genes_total
+    if genes_total > 0 && !annotation.is_empty() && genes_with_symbol == 0 {
+        let mut annotation_examples: Vec<&str> =
+            annotation.keys().map(String::as_str).collect();
+        annotation_examples.sort_unstable();
+        annotation_examples.truncate(3);
+        let gene_examples: Vec<&str> = genes
+            .iter()
+            .take(3)
+            .map(|gene| gene.gene_id.as_str())
+            .collect();
+        report.push(
+            Diagnostic::error(
+                "ANNOTATION_ID_MISMATCH",
+                format!(
+                    "annotation IDs do not match any GFF gene ID (annotation: {}; GFF genes: {})",
+                    annotation_examples.join(", "),
+                    gene_examples.join(", ")
+                ),
+            )
+            .with_file(path)
+            .with_context("entries", annotation.len())
+            .with_context("genes_total", genes_total)
+            .with_context("genes_with_symbol", genes_with_symbol)
+            .with_context("annotation_examples", annotation_examples.join(", "))
+            .with_context("gff_gene_examples", gene_examples.join(", "))
+            .with_suggestion(
+                "The annotation may use transcript/protein IDs instead of gene IDs (for example Fta_1G0000020.1 vs Fta_1G0000020). Re-upload the original eggNOG file, or ask the AI assistant to generate a transcript/protein-to-gene mapping table; do not rename IDs by hand.",
             ),
-        )
-        .with_file(path)
-        .with_context("entries", annotation.len()),
-    );
+        );
+    } else {
+        report.push(
+            Diagnostic::info(
+                "ANNOTATION_COVERAGE",
+                format!(
+                    "{} annotation entries; {genes_with_symbol}/{} genes have a symbol ({coverage:.1}%)",
+                    annotation.len(),
+                    genes_total
+                ),
+            )
+            .with_file(path)
+            .with_context("entries", annotation.len())
+            .with_context("genes_total", genes_total)
+            .with_context("genes_with_symbol", genes_with_symbol),
+        );
+    }
     stats
 }
 
@@ -763,6 +796,59 @@ pub struct PromoterStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_gene(id: &str) -> GeneModel {
+        GeneModel {
+            gene_id: id.to_string(),
+            symbol: id.to_string(),
+            chrom: "Chr1".to_string(),
+            start: 1,
+            end: 100,
+            strand: '+',
+            transcript_id: None,
+            tss: 100,
+            biotype: None,
+        }
+    }
+
+    #[test]
+    fn annotation_id_mismatch_is_an_error_with_ai_guidance() {
+        let genes = vec![test_gene("Fta_1G0000020"), test_gene("Fta_1G0000030")];
+        let mut annotation = HashMap::new();
+        annotation.insert("Fta_1G0000020.1".to_string(), "gene".to_string());
+        let mut report = Report::new("validate");
+        let stats = review_annotation(
+            &annotation,
+            &genes,
+            std::path::Path::new("annotation.tsv"),
+            &mut report,
+        );
+        assert_eq!(stats.genes_with_symbol, 0);
+        let diagnostic = report
+            .diagnostics
+            .iter()
+            .find(|d| d.code == "ANNOTATION_ID_MISMATCH")
+            .expect("mismatch diagnostic");
+        assert_eq!(diagnostic.severity, Severity::Error);
+        assert!(diagnostic
+            .suggestion
+            .as_deref()
+            .is_some_and(|value| value.contains("AI assistant")));
+        assert_eq!(
+            diagnostic.context.get("annotation_examples").map(String::as_str),
+            Some("Fta_1G0000020.1")
+        );
+
+        let mut exact = HashMap::new();
+        exact.insert("Fta_1G0000020".to_string(), "gene".to_string());
+        let mut ok_report = Report::new("validate");
+        review_annotation(&exact, &genes, std::path::Path::new("annotation.tsv"), &mut ok_report);
+        assert!(!ok_report.has_errors());
+        assert!(ok_report
+            .diagnostics
+            .iter()
+            .any(|d| d.code == "ANNOTATION_COVERAGE"));
+    }
 
     #[test]
     fn report_serializes_and_counts() {

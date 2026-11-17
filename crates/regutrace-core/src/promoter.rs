@@ -110,6 +110,7 @@ mod tests {
             strand,
             transcript_id: None,
             tss,
+            biotype: None,
         }
     }
 

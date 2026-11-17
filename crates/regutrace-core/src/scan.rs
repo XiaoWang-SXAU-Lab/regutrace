@@ -42,6 +42,19 @@ impl Scanner {
         }
     }
 
+    /// Smallest p-value this PWM can produce under the scanner's uniform
+    /// background discretization. A user threshold below this value cannot
+    /// yield hits for any promoter sequence.
+    pub fn min_pvalue(&self) -> f64 {
+        let best_score: i32 = self
+            .null
+            .rows
+            .iter()
+            .map(|row| row.iter().copied().max().unwrap_or(0))
+            .sum();
+        self.null.pvalue(best_score)
+    }
+
     pub fn scan(
         &self,
         promoter: &[u8],

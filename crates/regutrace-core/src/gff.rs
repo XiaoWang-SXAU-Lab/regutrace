@@ -38,6 +38,8 @@ pub struct GeneModel {
     pub strand: char,
     pub transcript_id: Option<String>,
     pub tss: u64,
+    /// GFF `gene_biotype`, when present. Inferred models have no biotype.
+    pub biotype: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -47,6 +49,7 @@ struct GeneInfo {
     start: u64,
     end: u64,
     strand: char,
+    biotype: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -176,6 +179,10 @@ pub fn read_gff_with_stats(path: &Path) -> Result<(Vec<GeneModel>, GffStats)> {
             let symbol = attr(attrs, "Name")
                 .or_else(|| attr(attrs, "gene_name"))
                 .unwrap_or_else(|| gene_id.clone());
+            let biotype = attr(attrs, "gene_biotype")
+                .or_else(|| attr(attrs, "biotype"))
+                .map(|v| v.trim().trim_matches('"').to_owned())
+                .filter(|v| !v.is_empty());
             genes.insert(
                 gene_id.clone(),
                 GeneInfo {
@@ -184,6 +191,7 @@ pub fn read_gff_with_stats(path: &Path) -> Result<(Vec<GeneModel>, GffStats)> {
                     start,
                     end,
                     strand,
+                    biotype,
                 },
             );
         } else if kind == "mRNA" || kind == "transcript" {
@@ -285,6 +293,7 @@ pub fn read_gff_with_stats(path: &Path) -> Result<(Vec<GeneModel>, GffStats)> {
                     start: *start,
                     end: *end,
                     strand: *strand,
+                    biotype: None,
                 },
             );
             tx.entry(parent.clone()).or_default().push(tx_info);
@@ -307,6 +316,7 @@ pub fn read_gff_with_stats(path: &Path) -> Result<(Vec<GeneModel>, GffStats)> {
                     start: first.start,
                     end: first.end,
                     strand: first.strand,
+                    biotype: None,
                 },
             );
             inferred_genes += 1;
@@ -381,6 +391,7 @@ pub fn read_gff_with_stats(path: &Path) -> Result<(Vec<GeneModel>, GffStats)> {
             strand,
             transcript_id,
             tss,
+            biotype: info.biotype,
         });
     }
     out.sort_by(|a, b| a.gene_id.cmp(&b.gene_id));
@@ -458,6 +469,29 @@ mod tests {
             let g = genes.iter().find(|g| g.gene_id == id).unwrap();
             assert_eq!(g.transcript_id.as_deref(), Some("tx1"));
         }
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn preserves_gene_biotype_for_filtering() {
+        let path = std::env::temp_dir().join(format!(
+            "regutrace_gff_biotype_{}.gff3",
+            std::process::id()
+        ));
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            writeln!(
+                f,
+                "Chr1\ttest\tgene\t100\t500\t.\t+\t.\tID=geneA;gene_biotype=protein_coding"
+            )
+            .unwrap();
+            writeln!(f, "Chr1\ttest\tmRNA\t100\t500\t.\t+\t.\tID=tx1;Parent=geneA").unwrap();
+        }
+        let genes = read_gff(&path).unwrap();
+        assert_eq!(
+            genes[0].biotype.as_deref(),
+            Some("protein_coding")
+        );
         let _ = std::fs::remove_file(path);
     }
 

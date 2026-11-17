@@ -10,12 +10,35 @@ use csv::{ReaderBuilder, WriterBuilder};
 
 use crate::fasta::open_reader;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct TfMotif {
     pub tf_id: String,
     pub tf_symbol: String,
     pub family: String,
     pub motif_id: String,
+    pub reference_tf_id: String,
+    pub mapping_method: String,
+    pub domain_mode: String,
+    pub extraction_family: String,
+    pub extraction_models: String,
+    pub domain_count: String,
+}
+
+/// One row of a species TF catalogue. `gene_id` is the stable join key used by
+/// mapped scans; motif-header names are never treated as gene identities.
+#[derive(Clone, Debug)]
+pub struct TfGene {
+    pub gene_id: String,
+    pub tf_symbol: String,
+    pub family: String,
+    pub status: String,
+    pub source: String,
+}
+
+impl TfGene {
+    pub fn is_identified(&self) -> bool {
+        self.status == "identified"
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -98,6 +121,14 @@ fn parse_f64_field(raw: String) -> Result<Option<f64>> {
 }
 
 pub fn read_tf_map(path: &Path) -> Result<Vec<TfMotif>> {
+    let mappings = read_tf_map_allow_empty(path)?;
+    if mappings.is_empty() {
+        bail!("tf-map has no usable rows: {}", path.display());
+    }
+    Ok(mappings)
+}
+
+pub fn read_tf_map_allow_empty(path: &Path) -> Result<Vec<TfMotif>> {
     let reader = open_reader(path)?;
     let mut rdr = ReaderBuilder::new()
         .delimiter(b'\t')
@@ -110,6 +141,12 @@ pub fn read_tf_map(path: &Path) -> Result<Vec<TfMotif>> {
         .with_context(|| format!("tf-map missing motif_id column: {}", path.display()))?;
     let symbol = find_col(&headers, &["tf_symbol", "symbol"]);
     let family = find_col(&headers, &["family", "tf_family"]);
+    let reference_tf = find_col(&headers, &["reference_tf_id"]);
+    let mapping_method = find_col(&headers, &["mapping_method"]);
+    let domain_mode = find_col(&headers, &["domain_mode"]);
+    let extraction_family = find_col(&headers, &["extraction_family"]);
+    let extraction_models = find_col(&headers, &["extraction_models"]);
+    let domain_count = find_col(&headers, &["domain_count"]);
     let mut out = Vec::new();
     let mut row = 1usize;
     for rec in rdr.records() {
@@ -129,12 +166,90 @@ pub fn read_tf_map(path: &Path) -> Result<Vec<TfMotif>> {
             family: cell(&rec, family),
             tf_id,
             motif_id,
+            reference_tf_id: cell(&rec, reference_tf),
+            mapping_method: cell(&rec, mapping_method),
+            domain_mode: cell(&rec, domain_mode),
+            extraction_family: cell(&rec, extraction_family),
+            extraction_models: cell(&rec, extraction_models),
+            domain_count: cell(&rec, domain_count),
         });
     }
-    if out.is_empty() {
-        bail!("tf-map has no usable rows: {}", path.display());
+    Ok(out)
+}
+
+pub fn read_tf_genes(path: &Path) -> Result<HashMap<String, TfGene>> {
+    let genes = read_tf_genes_allow_empty(path)?;
+    if genes.is_empty() {
+        bail!("tf-genes has no usable rows: {}", path.display());
+    }
+    Ok(genes)
+}
+
+pub fn read_tf_genes_allow_empty(path: &Path) -> Result<HashMap<String, TfGene>> {
+    let reader = open_reader(path)?;
+    let mut rdr = ReaderBuilder::new()
+        .delimiter(b'\t')
+        .flexible(true)
+        .from_reader(reader);
+    let headers = rdr
+        .headers()
+        .with_context(|| format!("read header {}", path.display()))?
+        .clone();
+    let gene = find_col(&headers, &["gene_id", "gene", "id"])
+        .with_context(|| format!("tf-genes missing gene_id column: {}", path.display()))?;
+    let symbol = find_col(&headers, &["tf_symbol", "symbol", "name"]);
+    let family = find_col(&headers, &["family", "tf_family"]);
+    let status = find_col(&headers, &["identification_status", "status"]);
+    let source = find_col(&headers, &["source", "source_release", "catalogue"]);
+    let mut out = HashMap::new();
+    let mut row = 1usize;
+    for rec in rdr.records() {
+        let rec = rec?;
+        row += 1;
+        let gene_id = cell(&rec, Some(gene));
+        if gene_id.is_empty() {
+            bail!("tf-genes row {row}: empty gene_id");
+        }
+        let status = if status.is_some() {
+            let s = cell(&rec, status).to_ascii_lowercase();
+            if s.is_empty() {
+                "identified".to_string()
+            } else {
+                s
+            }
+        } else {
+            "identified".to_string()
+        };
+        if !matches!(status.as_str(), "identified" | "ambiguous" | "rejected") {
+            bail!(
+                "tf-genes row {row}: invalid identification_status '{status}' (expected identified/ambiguous/rejected)"
+            );
+        }
+        let entry = TfGene {
+            tf_symbol: if symbol.is_some() {
+                let s = cell(&rec, symbol);
+                if s.is_empty() { gene_id.clone() } else { s }
+            } else {
+                gene_id.clone()
+            },
+            family: cell(&rec, family),
+            status,
+            source: cell(&rec, source),
+            gene_id: gene_id.clone(),
+        };
+        if out.insert(gene_id.clone(), entry).is_some() {
+            bail!("tf-genes duplicate gene_id: {gene_id}");
+        }
     }
     Ok(out)
+}
+
+fn strip_numeric_version(id: &str) -> Option<&str> {
+    let (base, version) = id.rsplit_once('.')?;
+    if base.is_empty() || version.is_empty() || !version.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some(base)
 }
 
 pub fn read_annotation(path: &Path) -> Result<HashMap<String, String>> {
@@ -147,16 +262,30 @@ pub fn read_annotation(path: &Path) -> Result<HashMap<String, String>> {
     let gene = find_col(&headers, &["gene_id", "gene", "id"])
         .with_context(|| format!("annotation missing gene_id column: {}", path.display()))?;
     let symbol = find_col(&headers, &["symbol", "gene_symbol", "name"]);
-    let mut out = HashMap::new();
+    let mut exact = HashMap::new();
     for rec in rdr.records() {
         let rec = rec?;
         let id = cell(&rec, Some(gene));
-        if id.is_empty() {
+        if id.is_empty() || id.starts_with('#') {
             continue;
         }
         let sym = cell(&rec, symbol);
-        if !sym.is_empty() {
-            out.insert(id, sym);
+        if !sym.is_empty() && sym != "-" {
+            exact.insert(id, sym);
+        }
+    }
+    // EggNOG often annotates protein/transcript IDs (Fta_1G0000020.1) while
+    // the GFF gene model uses gene IDs (Fta_1G0000020). Exact keys win; add
+    // gene-level aliases only when the gene key is absent.
+    let mut out = exact.clone();
+    for (id, sym) in &exact {
+        let mut base = id.as_str();
+        while let Some(next) = strip_numeric_version(base) {
+            if exact.contains_key(next) {
+                break;
+            }
+            out.entry(next.to_owned()).or_insert_with(|| sym.clone());
+            base = next;
         }
     }
     Ok(out)
@@ -413,8 +542,8 @@ mod tests {
         let user = dir.join(format!("regutrace_user_{}.tsv", std::process::id()));
         {
             let mut f = std::fs::File::create(&map).unwrap();
-            writeln!(f, "tf_id\ttf_symbol\tfamily\tmotif_id").unwrap();
-            writeln!(f, "AT1G00010\tTF1\tHSF\tMA0001.1").unwrap();
+            writeln!(f, "tf_id\ttf_symbol\tfamily\tmotif_id\tdomain_mode\textraction_family\textraction_models\tdomain_count").unwrap();
+            writeln!(f, "AT1G00010\tTF1\tHSF\tMA0001.1\tfull_architecture\tHSF\tHSF_DNA-bind\t1").unwrap();
         }
         {
             let mut f = std::fs::File::create(&user).unwrap();
@@ -424,11 +553,64 @@ mod tests {
         let m = read_tf_map(&map).unwrap();
         assert_eq!(m.len(), 1);
         assert_eq!(m[0].motif_id, "MA0001.1");
+        assert_eq!(m[0].domain_mode, "full_architecture");
+        assert_eq!(m[0].extraction_models, "HSF_DNA-bind");
+        assert_eq!(m[0].domain_count, "1");
         let u = read_user_list(&user).unwrap();
         assert_eq!(u.len(), 1);
         assert_eq!(u[0].evidence_level, "A");
         let _ = std::fs::remove_file(map);
         let _ = std::fs::remove_file(user);
+    }
+
+    #[test]
+    fn reads_annotation_and_adds_gene_level_aliases() {
+        let path = std::env::temp_dir().join(format!(
+            "regutrace_annotation_alias_{}.tsv",
+            std::process::id()
+        ));
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            writeln!(f, "gene_id\tsymbol\tdescription").unwrap();
+            writeln!(f, "Fta_1G0000020.1\tFta_1G0000020\tPhagocyte signaling-impaired protein").unwrap();
+            writeln!(f, "Fta_1G0000030.1\tPHOT\tphototropin").unwrap();
+            writeln!(f, "G1\tEXACT\texact gene").unwrap();
+            writeln!(f, "G1.1\tISOFORM\tisoform").unwrap();
+            writeln!(f, "## 3 queries scanned\t\t").unwrap();
+        }
+        let ann = read_annotation(&path).unwrap();
+        assert_eq!(ann["Fta_1G0000020"], "Fta_1G0000020");
+        assert_eq!(ann["Fta_1G0000030"], "PHOT");
+        assert_eq!(ann["G1"], "EXACT");
+        assert!(!ann.contains_key("## 3 queries scanned"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn reads_tf_genes_and_rejects_duplicates() {
+        let path = std::env::temp_dir().join(format!(
+            "regutrace_tfgenes_{}.tsv",
+            std::process::id()
+        ));
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            writeln!(f, "gene_id\ttf_symbol\tfamily\tidentification_status\tsource").unwrap();
+            writeln!(f, "AT1G01010\tNAC001\tNAC\tidentified\ttest").unwrap();
+            writeln!(f, "AT1G01020\tAT1G01020\t\tambiguous\ttest").unwrap();
+        }
+        let genes = read_tf_genes(&path).unwrap();
+        assert_eq!(genes.len(), 2);
+        assert!(genes["AT1G01010"].is_identified());
+        assert!(!genes["AT1G01020"].is_identified());
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            writeln!(f, "gene_id").unwrap();
+            writeln!(f, "AT1G01010").unwrap();
+            writeln!(f, "AT1G01010").unwrap();
+        }
+        let err = read_tf_genes(&path).unwrap_err().to_string();
+        assert!(err.contains("duplicate gene_id"), "{err}");
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

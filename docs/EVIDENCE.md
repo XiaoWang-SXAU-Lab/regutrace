@@ -41,6 +41,14 @@ must not be reported as validated binding.
 SQLite adds `id`, `record_key` (unique import key) and `imported_at`.
 Duplicate imports are ignored via `record_key`.
 
+## Pipeline trace tables
+
+The pipeline also writes `tf_motif_trace.tsv`, `motif_ambiguity.tsv` and
+`target_candidate_ties.tsv`. These are small derived views for tracing a local
+TF to its motif donor and to the candidate target/site; they do not replace the
+evidence table. See [TRACE.md](TRACE.md) for the lookup path, column meanings
+and the rule for preserving ambiguous/tied TF candidates.
+
 ## Coordinate conventions
 
 - GFF3 coordinates are parsed as 1-based inclusive.
