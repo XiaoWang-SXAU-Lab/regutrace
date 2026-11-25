@@ -117,7 +117,7 @@ Outputs: `phase5-coord-audit.tsv`, `phase5-policy-targets.tsv`, `phase5-policy-s
 
 ## 8. Limitations
 
-- Coordinate rerun used 2024 JASPAR and the 2025/2026 donor DBD preparation; 30 base TFs lacked coordinate-row matches (strict/calibrated or donor-set differences) and were handled as opaque single groups in best/reps.
+- Coordinate rerun used 2024 JASPAR and the 2025/2026 donor DBD preparation. 52 base TFs lacked coordinate-row matches; 22 coordinate-rerun TFs were outside the 1,143-row baseline; 1,089 TFs overlap. The 52 base TFs were handled as opaque single groups in best/reps.
 - Overlap is computed on query protein coordinates; donor coordinates are retained but not used for grouping.
 - No DNA-contact residue conservation was reliably available; it was not fabricated.
 - Specificity groups are PWM-similarity groups, not experimental specificity classes.

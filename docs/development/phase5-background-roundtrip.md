@@ -10,8 +10,8 @@ HF1 artifact:
 
 ```
 %LOCALAPPDATA%\rsWGCNA-build\phase5\background\hf1-background.db
-bytes    1,382,932,480
-sha256   f515861759b481343177fa6bb9656a315f781a743d9313bb2a0513cfbde4e622
+bytes    1,382,977,536
+sha256   ec1e7f7bba1c4c3290a57af4f1442088475b5c6fcec25d181d1969dad4c27020
 ```
 
 ## 2. Schema
@@ -21,7 +21,7 @@ sha256   f515861759b481343177fa6bb9656a315f781a743d9313bb2a0513cfbde4e622
 | `tf_catalogue` | 1,981 | all identified + ambiguous TF genes, family/status, motif/target counts |
 | `tf_motif` | 32,792 | strict/calibrated/exploratory mapping; coordinates and provenance when available |
 | `motif_target` | 4,644,497 | aggregated motif–target associations (n_sites, best p/score) |
-| `motif_registry` | 805 | motif name, length, PWM hash, specificity group, source |
+| `motif_registry` | 927 | motif name, length, PWM hash, specificity group, source |
 | `motif_testability` | 927 | attainable p, requested p, status, hit/mapped counts |
 | `promoter` | 37,415 | per-promoter scan/testability/site aggregation |
 | `scan_config` | 13 | scan parameters, background, cache and runtime |
@@ -29,7 +29,7 @@ sha256   f515861759b481343177fa6bb9656a315f781a743d9313bb2a0513cfbde4e622
 | `hits` | 0 | canonical schema required by `validate-db`; site-only runs do not materialize evidence rows |
 | `meta` | — | schema v2, policy, counts, checksums, limitations |
 
-The canonical `pairs` table is the rsWGCNA import contract. The normalized testability/promoter/scan layers were added without rebuilding the site table. The project-import timings above were measured before the v2 layers were appended; `validate-db` and standalone prior queries were re-run on the v2 DB and pass. The `hits`/`pairs` contract is unchanged. The 25M exploratory TF–target union is **not** materialized; `motif_target` + `tf_motif` preserve the broader evidence for advanced joins.
+The `motif_registry` was rebuilt from the exact 927-row motif library used by the scan, so all 679 mapped motif IDs have registry metadata. The canonical `pairs` table is the rsWGCNA import contract. The normalized testability/promoter/scan layers were added without rebuilding the site table. The project-import timings above were measured before the v2 layers were appended; `validate-db` and standalone prior queries were re-run on the v2 DB and pass. The `hits`/`pairs` contract is unchanged. The 25M exploratory TF–target union is **not** materialized; `motif_target` + `tf_motif` preserve the broader evidence for advanced joins.
 
 ## 3. Round-trip steps actually performed
 

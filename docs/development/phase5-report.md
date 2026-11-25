@@ -96,10 +96,10 @@ A standalone SQLite background was built from the HF1 site-only job and the coor
 | Item | Value |
 |---|---:|
 | File | `hf1-background.db` |
-| Size | 1,382,932,480 bytes (1.29 GiB) |
-| SHA-256 | `f515861759b481343177fa6bb9656a315f781a743d9313bb2a0513cfbde4e622` |
+| Size | 1,382,977,536 bytes (1.29 GiB) |
+| SHA-256 | `ec1e7f7bba1c4c3290a57af4f1442088475b5c6fcec25d181d1969dad4c27020` |
 | TF catalogue | 1,981 rows (1,907 identified + 74 ambiguous) |
-| TF–motif rows | 32,792 (27,720 with query DBD coordinates; 1,089 TFs) |
+| TF–motif rows | 32,792 (27,720 with query DBD coordinates; 1,089 TFs; 52 base TFs lack coordinates) |
 | Motif–target associations | 4,644,497 |
 | TF–target pairs (best-supported policy) | 7,394,435 |
 | Distinct TF with pairs | 991 |
