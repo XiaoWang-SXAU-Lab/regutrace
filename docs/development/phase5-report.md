@@ -106,7 +106,7 @@ A standalone SQLite background was built from the HF1 site-only job and the coor
 | Distinct motifs in mapping / with targets | 679 / 614 |
 | Target union | 37,415 |
 | Normalized layers | motif_testability 927; promoter 37,415; scan_config 13 |
-| Build wall time | ~180 s |
+| Build wall time | ~196 s including normalized layers |
 | Observed build working set | ~244 MB |
 | Dashboard peak working set during import | ~22 MB (validator child excluded) |
 | `validate-db` time | 62.7 s |

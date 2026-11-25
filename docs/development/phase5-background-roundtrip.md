@@ -62,7 +62,7 @@ The canonical `pairs` table is the rsWGCNA import contract. The normalized testa
 
 | Step | Result |
 |---|---:|
-| DB build (site read + aggregation + pairs + indexes) | ~180 s |
+| DB build (site read + aggregation + pairs + indexes) | ~196 s including normalized layers |
 | Observed build working set | ~244 MB |
 | Dashboard peak working set during import | ~22 MB (streamed upload; validator child not included) |
 | `validate-db` | 62.7 s |
