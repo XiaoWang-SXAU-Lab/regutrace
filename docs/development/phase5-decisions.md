@@ -111,3 +111,11 @@
 **Decision:** stop after Phase 5.
 
 **Why:** the task book ends at Phase 5. No WGCNA-specific regulatory-network algorithm was added to ReguTrace.
+
+## D15. Freeze background schema v3 and exact policy associations
+
+**Decision:** freeze the reusable background at schema **v3** / policy version **phase5-v1**. Store the exact all/best/reps TF–motif selections in `tf_motif_policy`, the coordinate rerun in `tf_motif_coordinate`, and policy parameters/provenance in `tf_motif_policy_config`; reconstruct target sets by joining to `motif_target` rather than materializing per-policy TF–target tables.
+
+**Why:** the earlier v2 DB could not exactly reproduce representative-group target sets. Exact per-TF verification and the actual v3 import/reopen regression remove that ambiguity while keeping the artifact compact.
+
+**Consequence:** downstream consumers must use the documented join. Any future change to selection rules requires a new policy version; any schema change requires a new schema version. Core prediction algorithms and thresholds remain frozen.

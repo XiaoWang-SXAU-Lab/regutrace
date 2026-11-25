@@ -228,52 +228,86 @@ def read_sites(path, motif_info_map):
     return target_index, bits, pvals, tidx
 
 
-def site_q_for_motif(pvals, motif_length, promoter_count, promoter_len, alpha=0.05):
-    """Conservative BH over hits ranked within the complete tested-window universe.
+def window_count(motif_length, promoter_count, promoter_len):
+    """Number of tested windows for one motif, both strands, all promoters."""
+    return promoter_count * max(1, 2 * (promoter_len - motif_length + 1))
 
-    Non-hit windows have p > requested cutoff; omitting them cannot make a hit
-    q smaller than the exact BH q, so this is a conservative (upper-bound) q.
+
+def _bh_q_sorted(sorted_p, total):
+    """BH q-values for sorted p-values with complete universe `total`.
+
+    Equal p-values receive the q-value at the last tie rank, so adjusted values
+    are monotone and ties are stable. This is BH, not an exact dependence-aware
+    FDR procedure; callers must state the completeness assumptions.
     """
-    n = len(pvals)
-    if n == 0:
-        return array.array("B", b"\x00" * n)
-    windows = max(1, 2 * (promoter_len - motif_length + 1))
-    total = promoter_count * windows
-    order = sorted(range(n), key=lambda i: pvals[i])
+    n = len(sorted_p)
     q = [1.0] * n
     running = 1.0
     for rank in range(n, 0, -1):
-        i = order[rank - 1]
-        value = min(1.0, total * pvals[i] / rank)
+        value = min(1.0, total * sorted_p[rank - 1] / rank)
         if value < running:
             running = value
-        q[i] = running
+        q[rank - 1] = running
+    # Collapse exact ties to the q at the last occurrence in sorted order.
+    i = 0
+    while i < n:
+        j = i + 1
+        while j < n and sorted_p[j] == sorted_p[i]:
+            j += 1
+        for k in range(i, j):
+            q[k] = q[j - 1]
+        i = j
+    return q
+
+
+def site_q_values(pvals, motif_length, promoter_count, promoter_len):
+    """BH q-values for site hits ranked within the complete window universe.
+
+    This is exact only for the hit ranks and is a conditional upper bound on
+    full BH when the hit table is complete through the cutoff, the window count
+    is exact, and no tests are missing. It is not an unconditional FDR control.
+    """
+    n = len(pvals)
+    if n == 0:
+        return []
+    total = window_count(motif_length, promoter_count, promoter_len)
+    order = sorted(range(n), key=lambda i: pvals[i])
+    sorted_p = [pvals[i] for i in order]
+    sorted_q = _bh_q_sorted(sorted_p, total)
+    q = [1.0] * n
+    for rank, index in enumerate(order):
+        q[index] = sorted_q[rank]
+    return q
+
+
+def site_q_for_motif(pvals, motif_length, promoter_count, promoter_len, alpha=0.05):
+    q = site_q_values(pvals, motif_length, promoter_count, promoter_len)
     return array.array("B", bytes(1 if value <= alpha else 0 for value in q))
 
 
-def promoter_q_pass(tidx, pvals, motif_length, promoter_count, promoter_len, alpha=0.05):
-    """Bonferroni promoter p from best site p and actual tested windows, then BH
-    across all eligible promoters. Non-hit promoters are omitted from the rank
-    list (their p is 1), which is conservative for hit q-values.
+def promoter_q_values(tidx, pvals, motif_length, promoter_count, promoter_len):
+    """Bonferroni promoter p from best site p, then BH across promoters.
+
+    Non-hit promoters are omitted from the hit rank list. This is a conditional
+    conservative approximation, not an exact dependence-aware FDR procedure.
     """
     best = {}
     for ti, p in zip(tidx, pvals):
         if ti not in best or p < best[ti]:
             best[ti] = p
     if not best:
-        return set()
+        return {}
     windows = max(1, 2 * (promoter_len - motif_length + 1))
     values = [(min(1.0, p * windows), ti) for ti, p in best.items()]
     values.sort()
-    q = [1.0] * len(values)
-    running = 1.0
-    for rank in range(len(values), 0, -1):
-        p, _ = values[rank - 1]
-        value = min(1.0, promoter_count * p / rank)
-        if value < running:
-            running = value
-        q[rank - 1] = running
-    return {ti for (p, ti), qv in zip(values, q) if qv <= alpha}
+    sorted_p = [p for p, _ in values]
+    q = _bh_q_sorted(sorted_p, promoter_count)
+    return {ti: q[i] for i, (_, ti) in enumerate(values)}
+
+
+def promoter_q_pass(tidx, pvals, motif_length, promoter_count, promoter_len, alpha=0.05):
+    q = promoter_q_values(tidx, pvals, motif_length, promoter_count, promoter_len)
+    return {ti for ti, value in q.items() if value <= alpha}
 
 
 def main():

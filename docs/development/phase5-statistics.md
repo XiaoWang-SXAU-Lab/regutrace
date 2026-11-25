@@ -46,7 +46,7 @@ Implementation:
 - cap at 1;
 - mark targets/sites with q≤0.05.
 
-Non-hit windows have p>cutoff and are omitted from the rank list; their terms can only make a hit's q smaller, so the reported hit q is a conservative upper bound. This is **not** ordinary BH on the prefiltered table: the complete tested-window count is in the denominator.
+Non-hit windows have p>cutoff and are omitted from the rank list. If the hit table is complete through the cutoff, the window count is exact and no tests are missing, omitting those terms can only increase q relative to full BH, so the result may be described as a conditional upper bound. It is **not** exact BH and does not provide unconditional FDR control, especially under dependence. This is **not** ordinary BH on the prefiltered table: the complete tested-window count is in the denominator.
 
 ## 4. Promoter-level statistic
 
@@ -70,7 +70,7 @@ This ignores dependence between overlapping windows and between motifs. It is a 
 
 Pair totals:
 
-| Policy | Original | Site FDR | Promoter FDR |
+| Policy | Original | Site BH q≤0.05 | Promoter BH q≤0.05 |
 |---|---:|---:|---:|
 | All | 25,481,360 | 2,842,315 | 2,174,252 |
 | Best | 7,394,435 | 393,946 | 264,936 |
@@ -97,7 +97,7 @@ We did not multiply across motifs by a Bonferroni factor because the motifs are 
 
 ## 8. Reproduce
 
-`scripts/phase5/aggregate_audit.py` computes both corrections from the existing site table. `scripts/phase5/null_shuffle.py` generates the shuffled promoters; the same `regutrace scan` binary with the three-motif map produces the null sites.
+`scripts/phase5/aggregate_audit.py` computes both corrections from the existing site table. `scripts/phase5/test_phase5_stats.py` covers the complete testing universe, total-universe denominator, tied p-values, monotonic adjusted values, promoter window counts, and empty/untestable motifs (7 tests). `scripts/phase5/null_shuffle.py` generates the shuffled promoters; the same `regutrace scan` binary with the three-motif map produces the null sites.
 
 ## 9. Limitations
 

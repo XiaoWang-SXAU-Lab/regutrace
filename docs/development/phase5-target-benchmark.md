@@ -40,7 +40,7 @@ Remove all benchmark TFs from the reference map, extract each query DBD with `pl
 | TGA1 | 4,089 | 1,807 | 2,362 | 883 | 0.374 | 0.489 | 6.89× | 0.255 | 0.22 |
 | MYB44 | 15,418 | 5,910 | 4,902 | 1,843 | 0.376 | 0.312 | 2.12× | 0.297 | 0.68 |
 
-`PPV_assay` is TP / predicted; it is not true precision because unpeaked genes are unknown, not negatives. `Enrichment` is PPV_assay / assay prevalence. AUPRC uses all 33,309 genes with unpeaked genes scored as non-positive; it is also optimistic/ambiguous.
+`PPV_assay` is TP / predicted; it is not true precision because unpeaked genes are unknown, not negatives. `Enrichment` is PPV_assay / assay prevalence. AUPRC uses all 33,309 genes with unpeaked genes scored as non-positive. The direction of bias is not established: unobserved genes may include true positives missed by the assay, while assay peaks may include indirect binding; the values are assay-defined comparative diagnostics, not biological precision.
 
 ## 4. Transferred-motif results
 
@@ -91,7 +91,20 @@ Empirical background increases sensitivity/recall and predicted target count, lo
 - The direct setting uses the TF's own JASPAR motif; the transfer setting excludes all benchmark TFs from donors but still uses the same reference pack and DBD model.
 - The benchmark confirms that motif quality and target ranking contain real signal, while also showing that raw target counts are not a precision estimate.
 
-## 7. Reproduce
+## 7. Future benchmark scope
+
+This benchmark is preliminary and assay-defined. A later, independent evaluation should add:
+
+- more TFs across families, including TFs with strict/calibrated mappings, not only exploratory transfer;
+- the same TFs evaluated under all / best-supported / representative policies;
+- raw p-value and site/promoter BH-filtered views side by side, without tuning thresholds on the benchmark;
+- random and composition-matched promoter baselines (including the dinucleotide-preserving null), reported alongside AUPRC;
+- explicit leakage checks for every donor/reference split, including motif-family and homology-cluster overlap;
+- a second assay series or species where direct motifs and held-out DBD transfer can both be evaluated.
+
+No threshold or policy will be selected from these benchmark results without a separate pre-specified evaluation.
+
+## 8. Reproduce
 
 Inputs and outputs live under `%LOCALAPPDATA%\rsWGCNA-build\phase5\dap\`:
 

@@ -87,7 +87,7 @@ Denominator 1,907 identified TFs; all policies start from the same 1,143 mapped 
 | Total TF–target pairs | 25,481,360 | 7,394,435 | 19,848,826 |
 | Untestable selected motifs (sum over TFs) | 2,487 | 162 | 736 |
 
-Best-supported reduces the pair total by 71.0%; representative groups reduce it by 22.1% while keeping 6 motifs. The best median TF retains 25.2% of its all-candidate targets.
+Best-supported reduces the pair total by 71.0%; representative groups reduce it by 22.1% while keeping 6 motifs. Median targets fall from 21,715 to 4,091 (81.16% reduction; 18.84% remaining).
 
 Threshold results for 0.5/0.7/0.8/0.9 are identical on HF1 because there is one DBD region per TF. The audit retains all four thresholds for reproducibility and future multi-domain genomes.
 
@@ -96,7 +96,7 @@ Threshold results for 0.5/0.7/0.8/0.9 are identical on HF1 because there is one 
 - The large exploratory sets are dominated by the **union of alternative donor-derived motif hypotheses**, not by multiple DBD regions.
 - Target overlap between motifs is low, so similar-looking motifs still produce largely different target sets.
 - Removing exact PWM duplicates alone is insufficient; specificity-group representatives are the meaningful intermediate.
-- Representative selection is an analysis/query/export policy. The original mappings and all-candidate union remain in the background database.
+- Representative selection is stored in the v3 `tf_motif_policy` table as exact TF–motif associations. The original mappings and all-candidate union remain in the background database; target sets are reconstructed by joining to `motif_target`.
 - Ambiguous mappings are visible in the all view but excluded from best/reps target sets by default.
 - Do not interpret best-supported as the biologically correct donor; it is a deterministic ranking with preserved tie/ambiguity metadata.
 
@@ -113,11 +113,11 @@ python scripts/phase5/aggregate_audit.py \
   --out-dir <phase5>/analysis2
 ```
 
-Outputs: `phase5-coord-audit.tsv`, `phase5-policy-targets.tsv`, `phase5-policy-summary.json`, `phase5-motif-aggregation.json`.
+Outputs: `phase5-coord-audit.tsv`, `phase5-policy-targets.tsv`, `phase5-policy-summary.json`, `phase5-motif-aggregation.json`. The final v3 DB stores these exact selections in `tf_motif_policy` and the coordinate rerun in `tf_motif_coordinate`; `verify_policy_layers.py` compares every TF and target set (0 mismatches).
 
 ## 8. Limitations
 
-- Coordinate rerun used 2024 JASPAR and the 2025/2026 donor DBD preparation. 52 base TFs lacked coordinate-row matches; 22 coordinate-rerun TFs were outside the 1,143-row baseline; 1,089 TFs overlap. The 52 base TFs were handled as opaque single groups in best/reps.
+- Coordinate status: **1,089 successfully joined + 2 key mismatches + 52 unavailable**. The 52 unavailable base TFs were handled as opaque single groups in best/reps; 22 coordinate-rerun TFs were outside the 1,143-row baseline. Mappings with `domain_mode=single_domain_fallback` are alignment-based fallbacks, labelled in the UI and not treated as full architecture.
 - Overlap is computed on query protein coordinates; donor coordinates are retained but not used for grouping.
 - No DNA-contact residue conservation was reliably available; it was not fabricated.
 - Specificity groups are PWM-similarity groups, not experimental specificity classes.
