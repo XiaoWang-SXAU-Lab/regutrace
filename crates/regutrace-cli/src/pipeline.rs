@@ -207,10 +207,65 @@ fn bool_option(opts: &HashMap<String, String>, key: &str) -> bool {
     })
 }
 
+fn read_tsv_rows(path: &Path) -> Result<Vec<BTreeMap<String, String>>> {
+    let mut reader = ReaderBuilder::new()
+        .delimiter(b'\t')
+        .flexible(true)
+        .from_path(path)
+        .with_context(|| format!("open {}", path.display()))?;
+    let headers = reader.headers()?.clone();
+    let mut rows = Vec::new();
+    for record in reader.records() {
+        let record = record?;
+        let mut row = BTreeMap::new();
+        for (index, header) in headers.iter().enumerate() {
+            row.insert(header.to_owned(), record.get(index).unwrap_or("").to_owned());
+        }
+        rows.push(row);
+    }
+    Ok(rows)
+}
+
+fn scan_summary_context(report: &serde_json::Value) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    if let Some(diagnostics) = report.get("diagnostics").and_then(|value| value.as_array()) {
+        for diagnostic in diagnostics {
+            if diagnostic.get("code").and_then(|value| value.as_str()) == Some("SCAN_SUMMARY") {
+                if let Some(context) = diagnostic.get("context").and_then(|value| value.as_object())
+                {
+                    for (key, value) in context {
+                        if let Some(value) = value.as_str() {
+                            out.insert(key.clone(), value.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+fn parse_background_context(value: &str) -> Option<[f64; 4]> {
+    let values: Vec<f64> = value
+        .split(',')
+        .map(|part| part.trim().parse::<f64>().ok())
+        .collect::<Option<Vec<_>>>()?;
+    if values.len() != 4
+        || values
+            .iter()
+            .any(|value| !value.is_finite() || *value <= 0.0)
+    {
+        return None;
+    }
+    Some([values[0], values[1], values[2], values[3]])
+}
+
 fn output_paths(out_dir: &Path) -> BTreeMap<&'static str, PathBuf> {
     [
         ("tf_genes", "tf_genes.tsv"),
         ("tf_map", "tf_map.tsv"),
+        ("mapping_diagnostics", "mapping-diagnostics.tsv"),
+        ("mapping_diagnostics_family", "mapping-diagnostics.family.tsv"),
         ("evidence", "evidence.tsv"),
         ("promoters", "promoters.fa"),
         ("progress", "progress.json"),
@@ -219,6 +274,10 @@ fn output_paths(out_dir: &Path) -> BTreeMap<&'static str, PathBuf> {
         ("target_candidate_ties", trace::TARGET_CANDIDATE_TIES_FILE),
         ("database", "evidence.db"),
         ("scan_report", "scan-report.json"),
+        ("sites", "motif-site-hits.tsv"),
+        ("motif_testability", "motif-testability.tsv"),
+        ("promoter_summary", "promoter-summary.tsv"),
+        ("scan_manifest", "scan-manifest.json"),
         ("pipeline_report", "pipeline-report.json"),
     ]
     .into_iter()
@@ -227,7 +286,14 @@ fn output_paths(out_dir: &Path) -> BTreeMap<&'static str, PathBuf> {
 }
 
 pub(super) fn run(args: &[String]) -> Result<()> {
-    let opts = parse_options_with_flags(args, &["--include-single-domain-fallback"])?;
+    let opts = parse_options_with_flags(
+        args,
+        &[
+            "--include-single-domain-fallback",
+            "--reuse-exact-pwm",
+            "--phase3-artifacts",
+        ],
+    )?;
     for key in opts.keys() {
         if !matches!(
             key.as_str(),
@@ -239,10 +305,14 @@ pub(super) fn run(args: &[String]) -> Result<()> {
                 | "--annotation"
                 | "--out-dir"
                 | "--include-single-domain-fallback"
+                | "--reuse-exact-pwm"
+                | "--phase3-artifacts"
                 | "--promoter-len"
                 | "--downstream"
                 | "--pvalue"
                 | "--background"
+                | "--background-mode"
+                | "--scan-cache"
                 | "--gene-biotype"
                 | "--threads"
                 | "--hmmsearch"
@@ -290,6 +360,18 @@ pub(super) fn run(args: &[String]) -> Result<()> {
         .map(|value| super::parse_background(value))
         .transpose()?
         .unwrap_or([0.25; 4]);
+    let background_mode = opts
+        .get("--background-mode")
+        .cloned()
+        .unwrap_or_else(|| "uniform".to_string());
+    if !matches!(background_mode.as_str(), "uniform" | "empirical") {
+        bail!("--background-mode must be uniform or empirical");
+    }
+    if background_mode == "empirical" && opts.contains_key("--background") {
+        bail!("--background and --background-mode empirical are mutually exclusive");
+    }
+    let reuse_exact_pwm = bool_option(&opts, "--reuse-exact-pwm");
+    let phase3_artifacts = bool_option(&opts, "--phase3-artifacts");
     let gene_biotype = opts
         .get("--gene-biotype")
         .cloned()
@@ -377,6 +459,10 @@ pub(super) fn run(args: &[String]) -> Result<()> {
         blastp.to_string_lossy().into_owned(),
         "--out".to_owned(),
         outputs["tf_map"].to_string_lossy().into_owned(),
+        "--diagnostics-out".to_owned(),
+        outputs["mapping_diagnostics"].to_string_lossy().into_owned(),
+        "--diagnostics-family-out".to_owned(),
+        outputs["mapping_diagnostics_family"].to_string_lossy().into_owned(),
     ];
     if pack.paths.contains_key("reference_proteins") {
         args.extend(["--reference-proteins".to_owned(), pack.path("reference_proteins").display().to_string()]);
@@ -401,6 +487,10 @@ pub(super) fn run(args: &[String]) -> Result<()> {
             outputs["tf_map"].display()
         )
     })?;
+    let mapping_diagnostics_rows = read_tsv_rows(&outputs["mapping_diagnostics"])
+        .with_context(|| format!("read {}", outputs["mapping_diagnostics"].display()))?;
+    let mapping_family_rows = read_tsv_rows(&outputs["mapping_diagnostics_family"])
+        .with_context(|| format!("read {}", outputs["mapping_diagnostics_family"].display()))?;
     let map_rows = tf_map.len();
     let map_tfs: BTreeSet<&str> = tf_map.iter().map(|tf| tf.tf_id.as_str()).collect();
     let full_rows = tf_map
@@ -440,8 +530,6 @@ pub(super) fn run(args: &[String]) -> Result<()> {
         promoter_len.to_string(),
         "--pvalue".to_owned(),
         pvalue.to_string(),
-        "--background".to_owned(),
-        format!("{},{},{},{}", background[0], background[1], background[2], background[3]),
         "--promoters-out".to_owned(),
         outputs["promoters"].to_string_lossy().into_owned(),
         "--progress-json".to_owned(),
@@ -451,6 +539,38 @@ pub(super) fn run(args: &[String]) -> Result<()> {
         "--out".to_owned(),
         outputs["evidence"].to_string_lossy().into_owned(),
     ];
+    if background_mode == "uniform" {
+        args.extend([
+            "--background".to_owned(),
+            format!(
+                "{},{},{},{}",
+                background[0], background[1], background[2], background[3]
+            ),
+        ]);
+    } else {
+        args.extend([
+            "--background-mode".to_owned(),
+            background_mode.clone(),
+        ]);
+    }
+    if reuse_exact_pwm {
+        args.push("--reuse-exact-pwm".to_owned());
+    }
+    if let Some(cache) = opts.get("--scan-cache") {
+        args.extend(["--scan-cache".to_owned(), cache.clone()]);
+    }
+    if phase3_artifacts {
+        args.extend([
+            "--sites-out".to_owned(),
+            outputs["sites"].to_string_lossy().into_owned(),
+            "--motif-testability-out".to_owned(),
+            outputs["motif_testability"].to_string_lossy().into_owned(),
+            "--promoter-summary-out".to_owned(),
+            outputs["promoter_summary"].to_string_lossy().into_owned(),
+            "--scan-manifest".to_owned(),
+            outputs["scan_manifest"].to_string_lossy().into_owned(),
+        ]);
+    }
     if include_fallback {
         args.push("--include-single-domain-fallback".to_owned());
     }
@@ -479,6 +599,29 @@ pub(super) fn run(args: &[String]) -> Result<()> {
         })?,
     )
     .with_context(|| format!("parse scan report {}", outputs["scan_report"].display()))?;
+    let scan_context = scan_summary_context(&scan_report);
+    let effective_background = scan_context
+        .get("background_values")
+        .and_then(|value| parse_background_context(value))
+        .unwrap_or(background);
+    let used_phase3_scan = scan_context
+        .get("phase3_scan")
+        .is_some_and(|value| value == "true");
+    let scan_manifest: serde_json::Value = if outputs["scan_manifest"].exists() {
+        serde_json::from_reader(
+            File::open(&outputs["scan_manifest"]).with_context(|| {
+                format!("open scan manifest {}", outputs["scan_manifest"].display())
+            })?,
+        )
+        .with_context(|| {
+            format!(
+                "parse scan manifest {}",
+                outputs["scan_manifest"].display()
+            )
+        })?
+    } else {
+        serde_json::Value::Null
+    };
     let gene_biotype_status =
         gene_biotype_status(&gene_biotype, gene_biotype_from_pack, &scan_report);
 
@@ -531,7 +674,8 @@ pub(super) fn run(args: &[String]) -> Result<()> {
     let min_pvalue_by_motif: BTreeMap<String, f64> = motifs
         .iter()
         .map(|motif| {
-            let min_p = scan::Scanner::new(motif, &[0.25; 4], 10.0).min_pvalue();
+            let min_p =
+                scan::Scanner::new(motif, &effective_background, 10.0).min_pvalue();
             (motif.id.clone(), min_p)
         })
         .collect();
@@ -672,7 +816,10 @@ pub(super) fn run(args: &[String]) -> Result<()> {
         "parameters": {
             "promoter_len": promoter_len,
             "pvalue": pvalue,
-            "background": background,
+            "background": effective_background,
+            "background_mode": background_mode,
+            "exact_pwm_reuse": reuse_exact_pwm,
+            "phase3_artifacts": phase3_artifacts,
             "include_single_domain_fallback": include_fallback,
             "gene_biotype": &gene_biotype,
             "gene_biotype_from_pack": gene_biotype_from_pack,
@@ -706,6 +853,13 @@ pub(super) fn run(args: &[String]) -> Result<()> {
                 "examples": tf_without_motif.iter().take(100).collect::<Vec<_>>(),
             },
         },
+        "mapping_diagnostics": {
+            "tf_table": outputs["mapping_diagnostics"].display().to_string(),
+            "family_table": outputs["mapping_diagnostics_family"].display().to_string(),
+            "tf_rows": mapping_diagnostics_rows.len(),
+            "family_rows": mapping_family_rows.len(),
+            "families": mapping_family_rows,
+        },
         "trace": {
             "tf_motif_rows": trace_summary.tf_motif_rows,
             "ambiguous_tf_motif_rows": trace_summary.ambiguous_tf_motif_rows,
@@ -730,6 +884,27 @@ pub(super) fn run(args: &[String]) -> Result<()> {
             "fallback_rows": fallback_report,
             "excluded_fallback_rows": if include_fallback { serde_json::json!([]) } else { serde_json::json!(fallback_report) },
             "gene_biotype": gene_biotype_status,
+        },
+        "phase3": {
+            "enabled": used_phase3_scan,
+            "background_mode": scan_context.get("background_mode"),
+            "unique_site_hits": scan_context.get("unique_site_hits").and_then(|value| value.parse::<u64>().ok()),
+            "motif_id_hits": scan_context.get("motif_id_hits").and_then(|value| value.parse::<u64>().ok()),
+            "evidence_rows": scan_context.get("evidence_rows").and_then(|value| value.parse::<u64>().ok()),
+            "pwm_groups": scan_context.get("pwm_groups").and_then(|value| value.parse::<u64>().ok()),
+            "unique_pwms": scan_context.get("unique_pwms").and_then(|value| value.parse::<u64>().ok()),
+            "duplicate_pwm_groups": scan_context.get("duplicate_pwm_groups").and_then(|value| value.parse::<u64>().ok()),
+            "cache_hits": scan_context.get("cache_hits").and_then(|value| value.parse::<u64>().ok()),
+            "cache_misses": scan_context.get("cache_misses").and_then(|value| value.parse::<u64>().ok()),
+            "testable_motifs": scan_context.get("testable_motifs").and_then(|value| value.parse::<u64>().ok()),
+            "unattainable_motifs": scan_context.get("unattainable_motifs").and_then(|value| value.parse::<u64>().ok()),
+            "artifacts": {
+                "sites": outputs["sites"].display().to_string(),
+                "motif_testability": outputs["motif_testability"].display().to_string(),
+                "promoter_summary": outputs["promoter_summary"].display().to_string(),
+                "scan_manifest": outputs["scan_manifest"].display().to_string(),
+            },
+            "manifest": scan_manifest,
         },
         "motifs": {
             "pack_motifs": pack_motif_ids.len(),

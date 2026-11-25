@@ -25,9 +25,12 @@ use rusqlite::types::Value;
 use rusqlite::{params_from_iter, params, Connection, OpenFlags};
 use serde_json::Value as JsonValue;
 
+mod enrich;
 mod motif_transfer;
 mod pipeline;
 mod plant_tfs;
+mod registry;
+mod scan_phase3;
 mod trace;
 
 struct Args {
@@ -48,6 +51,8 @@ struct Args {
     pvalue: f64,
     min_score: Option<f64>,
     background: [f64; 4],
+    background_mode: String,
+    background_explicit: bool,
     both_strands: bool,
     max_genes: Option<usize>,
     gene_biotype: Option<String>,
@@ -57,6 +62,25 @@ struct Args {
     stream: bool,
     threads: Option<usize>,
     strict: bool,
+    reuse_exact_pwm: bool,
+    scan_cache: Option<PathBuf>,
+    sites_out: Option<PathBuf>,
+    sites_only: bool,
+    motif_testability_out: Option<PathBuf>,
+    promoter_summary_out: Option<PathBuf>,
+    scan_manifest_out: Option<PathBuf>,
+}
+
+impl Args {
+    fn uses_phase3_scan(&self) -> bool {
+        self.background_mode != "uniform"
+            || self.reuse_exact_pwm
+            || self.scan_cache.is_some()
+            || self.sites_out.is_some()
+            || self.motif_testability_out.is_some()
+            || self.promoter_summary_out.is_some()
+            || self.scan_manifest_out.is_some()
+    }
 }
 
 impl Default for Args {
@@ -79,6 +103,8 @@ impl Default for Args {
             pvalue: 1e-4,
             min_score: None,
             background: [0.25; 4],
+            background_mode: "uniform".to_string(),
+            background_explicit: false,
             both_strands: true,
             max_genes: None,
             gene_biotype: None,
@@ -88,6 +114,13 @@ impl Default for Args {
             stream: false,
             threads: None,
             strict: false,
+            reuse_exact_pwm: false,
+            scan_cache: None,
+            sites_out: None,
+            sites_only: false,
+            motif_testability_out: None,
+            promoter_summary_out: None,
+            scan_manifest_out: None,
         }
     }
 }
@@ -109,9 +142,14 @@ USAGE:\n\
   regutrace convert --input <edges.tsv|csv[.gz]> --out <file> \\\n\
     --format sqlite|csv|tsv|jsonl [--gzip]\n\
   regutrace prior --db <tf_target.db> --targets <genes.txt> --out <upstream.tsv>\n\
+  regutrace enrich --sites <motif-site-hits.tsv> --promoter-summary <promoter-summary.tsv> \\\n\
+    --gene-sets <sets.gmt> --out <enrichment.tsv> [--summary-out <summary.tsv>]\n\
   regutrace identify-plant-tfs (--proteins <faa[.gz]> | --cds <fna[.gz]>) (--hmm <models.hmm> | --hmm-list <files.txt>) --rules <rules.json>\n\
     (--gene-map <map.tsv> | --gff <gff3> | --gene-ids) [--hmmsearch <exe>] [--threads <n>] --out <tf_genes.tsv>\n\
-  regutrace map-tf-motifs --tf-genes <tsv> --reference-map <tsv> (--forward <blast.tsv> --reverse <blast.tsv> | --proteins <faa> --reference-domains <faa> --dbd-models <json>) --out <tf_map.tsv>\n\
+  regutrace map-tf-motifs --tf-genes <tsv> --reference-map <tsv> (--forward <blast.tsv> --reverse <blast.tsv> | --proteins <faa> --reference-domains <faa> --dbd-models <json>) --out <tf_map.tsv> [--diagnostics-out <tsv>] [--diagnostics-family-out <tsv>]\n\
+  regutrace dbd-extract --tf-genes <tsv> --proteins <faa> --dbd-models <json> --out-faa <faa> --out-tsv <tsv> [--include-ambiguous true|false]\n\
+  regutrace map-dbd-motifs --tf-genes <tsv> --proteins <faa> --dbd-models <json> --reference-map <tsv> --donor-dbd <tsv> --donor-dbd-faa <faa> --threshold-config <json> --out <tf_map.tsv> [--allow-uncalibrated true] [--specificity-groups <tsv>] [--require-reciprocal-dbd true] [--dbd-alignments <tsv>] [--reverse-dbd-alignments <tsv>] [--diagnostics-out <tsv>] [--reference-pack-version <id>] [--blastp <exe>]\n\
+  regutrace registry inspect (--reference-pack <dir> | --registry <tsv>) --out <registry.tsv> [--summary-json <json>] [--motif-library <txt>] [--donor-proteins <faa>]\n\
   regutrace classify-tfs --domtblout <hits> --rules <rules.json> --out <proteins.tsv>\n\
   regutrace identify-tfs --proteins <representative.faa> --hmm <tf.hmm> \\\n\
     [--family-map <model_family.tsv>] [--evalue <e>] [--min-coverage <0..1>] --out <tf_genes.tsv>\n\
@@ -157,6 +195,14 @@ IDENTIFY-TFS OPTIONS:\n\
   --pvalue <p>            PWM hit p-value cutoff (default 1e-4)\n\
   --min-score <s>         minimum PWM score (log2 odds; for benchmarks)\n\
   --background <A,C,G,T>  base probabilities (default 0.25,0.25,0.25,0.25)\n\
+  --background-mode <m>   uniform (default) or empirical promoter A/C/G/T model\n\
+  --reuse-exact-pwm       scan one representative per bit-identical PWM matrix\n\
+  --scan-cache <dir>      persistent per-PWM scan cache keyed by all scan inputs\n\
+  --sites-out <tsv>       write one row per unique PWM site (not per TF)\n\
+  --sites-only            scan unique PWM sites without TF evidence rows\n\
+  --motif-testability-out <tsv>  attainable p-value and status per motif\n\
+  --promoter-summary-out <tsv>   per-promoter site summary\n\
+  --scan-manifest <json>  scan provenance, cache and reuse statistics\n\
   --annotation <tsv>      gene_id/symbol annotation for target symbols\n\
   --user-list <tsv>       user TF–target evidence list to append\n\
   --max-genes <n>         only process the first n genes (testing)\n\
@@ -263,7 +309,39 @@ fn parse_scan_args(args: &[String]) -> Result<Args> {
                     .context("invalid --pvalue")?
             }
             "--background" => {
-                a.background = parse_background(&it.next().context("--background needs a value")?)?
+                a.background = parse_background(&it.next().context("--background needs a value")?)?;
+                a.background_explicit = true;
+            }
+            "--background-mode" => {
+                let value = it.next().context("--background-mode needs a value")?;
+                if value != "uniform" && value != "empirical" {
+                    bail!("--background-mode must be uniform or empirical, got {value}");
+                }
+                a.background_mode = value.to_string();
+            }
+            "--reuse-exact-pwm" => a.reuse_exact_pwm = true,
+            "--scan-cache" => {
+                a.scan_cache =
+                    Some(PathBuf::from(it.next().context("--scan-cache needs a value")?))
+            }
+            "--sites-out" => {
+                a.sites_out = Some(PathBuf::from(it.next().context("--sites-out needs a value")?))
+            }
+            "--sites-only" => a.sites_only = true,
+            "--motif-testability-out" => {
+                a.motif_testability_out = Some(PathBuf::from(
+                    it.next().context("--motif-testability-out needs a value")?,
+                ))
+            }
+            "--promoter-summary-out" => {
+                a.promoter_summary_out = Some(PathBuf::from(
+                    it.next().context("--promoter-summary-out needs a value")?,
+                ))
+            }
+            "--scan-manifest" => {
+                a.scan_manifest_out = Some(PathBuf::from(
+                    it.next().context("--scan-manifest needs a value")?,
+                ))
             }
             "--max-genes" => {
                 a.max_genes = Some(
@@ -326,6 +404,26 @@ fn parse_scan_args(args: &[String]) -> Result<Args> {
     }
     if a.gene_biotype_from_pack && a.gene_biotype.is_none() {
         bail!("--gene-biotype-from-pack requires --gene-biotype");
+    }
+    if a.sites_only && a.sites_out.is_none() {
+        bail!("--sites-only requires --sites-out");
+    }
+    if a.background_mode == "empirical" && a.background_explicit {
+        bail!("--background and --background-mode empirical are mutually exclusive");
+    }
+    if let Some(out) = &a.out {
+        for (label, path) in [
+            ("--sites-out", &a.sites_out),
+            ("--motif-testability-out", &a.motif_testability_out),
+            ("--promoter-summary-out", &a.promoter_summary_out),
+            ("--scan-manifest", &a.scan_manifest_out),
+        ] {
+            if let Some(path) = path {
+                if path == out {
+                    bail!("{label} must differ from --out");
+                }
+            }
+        }
     }
     Ok(a)
 }
@@ -1257,6 +1355,175 @@ fn run_scan(
     }
     if missing_motif > 0 {
         eprintln!("warning: {missing_motif} TF–motif rows reference motifs not in the library");
+    }
+
+    if args.uses_phase3_scan() {
+        let threads = effective_threads(args.threads);
+        let pool = if threads > 1 {
+            Some(
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(threads)
+                    .build()
+                    .context("create scan thread pool")?,
+            )
+        } else {
+            None
+        };
+        let stats = scan_phase3::run(
+            args,
+            &promoters,
+            &annotation,
+            &motif_to_tfs,
+            &motif_by_id,
+            threads,
+            pool.as_ref(),
+            progress,
+        )
+        .context("phase 3 scan failed")?;
+
+        let user_count = match &args.user_list {
+            Some(path) => {
+                report.add_input("user_list", path);
+                let mut user = io::read_user_list(path)?;
+                diagnostics::review_user_list(&user, path, report);
+                let tf_symbol_by_id: HashMap<&str, &str> = tf_map
+                    .iter()
+                    .map(|t| (t.tf_id.as_str(), t.tf_symbol.as_str()))
+                    .collect();
+                for e in &mut user {
+                    if e.tf_symbol.is_empty() {
+                        if let Some(s) = tf_symbol_by_id.get(e.tf_id.as_str()) {
+                            e.tf_symbol = (*s).to_string();
+                        }
+                    }
+                    if e.target_symbol.is_empty() {
+                        if let Some(s) = annotation.get(&e.target_id) {
+                            e.target_symbol = s.clone();
+                        }
+                    }
+                }
+                let n = user.len();
+                if n > 0 {
+                    progress.write(
+                        "writing_evidence",
+                        "running",
+                        0,
+                        1,
+                        "appending curated evidence rows",
+                        true,
+                    );
+                    let mut stream = io::EdgeStream::append(&out_path)?;
+                    for e in &user {
+                        stream.write(e)?;
+                    }
+                    stream.flush()?;
+                }
+                n
+            }
+            None => 0,
+        };
+        let total_edges = stats.evidence_rows as usize + user_count;
+        if stats.unattainable_motifs > 0 {
+            report.warning(
+                "MOTIF_THRESHOLD_UNATTAINABLE",
+                format!(
+                    "requested p={} is below the attainable floor for {} mapped motif(s); these motifs cannot produce sites",
+                    args.pvalue, stats.unattainable_motifs
+                ),
+            );
+        }
+        eprintln!(
+            "unique PWM groups: {}, unique PWM sites: {}, motif-ID site hits: {}, evidence rows: {}, user rows: {}, total edges: {}, cache hits/misses: {}/{}, background: {}",
+            stats.pwm_groups,
+            stats.unique_site_hits,
+            stats.motif_id_hits,
+            stats.evidence_rows,
+            user_count,
+            total_edges,
+            stats.cache_hits,
+            stats.cache_misses,
+            stats.background.mode
+        );
+        eprintln!("wrote {}", out_path.display());
+        let mut diagnostic = diagnostics::Diagnostic::info(
+            "SCAN_SUMMARY",
+            format!(
+                "{} genes, {} promoters, {} unique PWM sites, {} motif-ID site hits, {} evidence rows, {} user rows, {} total evidence rows",
+                gene_count,
+                promoters.len(),
+                stats.unique_site_hits,
+                stats.motif_id_hits,
+                stats.evidence_rows,
+                user_count,
+                total_edges
+            ),
+        )
+        .with_context("output", out_path.display().to_string())
+        .with_context("genes", gene_count)
+        .with_context("promoters", promoters.len())
+        .with_context("unique_site_hits", stats.unique_site_hits)
+        .with_context("motif_id_hits", stats.motif_id_hits)
+        // Compatibility alias for consumers of the legacy summary field.
+        .with_context("motif_hits", stats.unique_site_hits)
+        .with_context("evidence_rows", stats.evidence_rows)
+        .with_context("user_rows", user_count)
+        .with_context("total_edges", total_edges)
+        .with_context("motifs_scanned", stats.mapped_motif_ids)
+        .with_context("tf_motif_pairs", tf_map.len() - missing_motif)
+        .with_context("pwm_groups", stats.pwm_groups)
+        .with_context("unique_pwms", stats.unique_pwms)
+        .with_context("duplicate_pwm_groups", stats.duplicate_pwm_groups)
+        .with_context("cache_hits", stats.cache_hits)
+        .with_context("cache_misses", stats.cache_misses)
+        .with_context("testable_groups", stats.testable_groups)
+        .with_context("executed_promoter_scans", stats.executed_promoter_scans)
+        .with_context(
+            "skipped_unattainable_scans",
+            stats.skipped_unattainable_scans,
+        )
+        .with_context("motifs_with_hits", stats.motifs_with_hits)
+        .with_context("motifs_without_hits", stats.motifs_without_hits)
+        .with_context("background_mode", stats.background.mode.clone())
+        .with_context(
+            "background_values",
+            format!(
+                "{:.17e},{:.17e},{:.17e},{:.17e}",
+                stats.background.values[0],
+                stats.background.values[1],
+                stats.background.values[2],
+                stats.background.values[3]
+            ),
+        )
+        .with_context(
+            "background_raw_counts",
+            format!(
+                "{},{},{},{}",
+                stats.background.raw_counts[0],
+                stats.background.raw_counts[1],
+                stats.background.raw_counts[2],
+                stats.background.raw_counts[3]
+            ),
+        )
+        .with_context("testable_motifs", stats.testable_motifs)
+        .with_context("unattainable_motifs", stats.unattainable_motifs)
+        .with_context("threads", threads)
+        .with_context("phase3_scan", true);
+        if let Some(path) = &stats.sites_path {
+            diagnostic = diagnostic.with_context("sites_out", path.display().to_string());
+        }
+        if let Some(path) = &stats.testability_path {
+            diagnostic =
+                diagnostic.with_context("testability_out", path.display().to_string());
+        }
+        if let Some(path) = &stats.promoter_summary_path {
+            diagnostic =
+                diagnostic.with_context("promoter_summary_out", path.display().to_string());
+        }
+        if let Some(path) = &stats.manifest_path {
+            diagnostic = diagnostic.with_context("scan_manifest", path.display().to_string());
+        }
+        report.push(diagnostic);
+        return Ok(());
     }
 
     let mut scanners: HashMap<String, scan::Scanner> = HashMap::new();
@@ -2665,8 +2932,12 @@ fn main() {
         Some("stats") => cmd_stats(&args[1..]),
         Some("convert") => cmd_convert(&args[1..]),
         Some("prior") => cmd_prior(&args[1..]),
+        Some("enrich") => enrich::run(&args[1..]),
         Some("identify-plant-tfs") => plant_tfs::run(&args[1..]),
         Some("map-tf-motifs") => motif_transfer::run(&args[1..]),
+        Some("dbd-extract") => motif_transfer::run_dbd_extract(&args[1..]),
+        Some("map-dbd-motifs") => motif_transfer::run_map_dbd_motifs(&args[1..]),
+        Some("registry") => registry::run(&args[1..]),
         Some("classify-tfs") => cmd_classify_tfs(&args[1..]),
         Some("identify-tfs") => cmd_identify_tfs(&args[1..]),
         Some("validate-db") => cmd_validate_db(&args[1..]),

@@ -1,0 +1,31 @@
+{
+  "version": "plant-calibrated-v1",
+  "calibration_status": "calibrated",
+  "source": "Phase 2.5 donor-held-out DBD calibration; see docs/development/dbd-calibration-methodology.md",
+  "motif_similarity_target": 0.8,
+  "high_similarity_target": 0.9,
+  "families": {
+    "HD-ZIP": {
+      "min_identity": 75,
+      "min_coverage": 0.9,
+      "max_evalue": 1e-05,
+      "source": "phase2.5 nested species-grouped cross-validation",
+      "donors": 34,
+      "nested_oof_precision": "1.0000",
+      "nested_oof_precision_ci_low": "0.7008",
+      "nested_oof_coverage": "0.2647",
+      "nested_oof_ambiguous": 5
+    },
+    "TCP": {
+      "min_identity": 70,
+      "min_coverage": 0.5,
+      "max_evalue": 1e-05,
+      "source": "phase2.5 nested species-grouped cross-validation",
+      "donors": 35,
+      "nested_oof_precision": "1.0000",
+      "nested_oof_precision_ci_low": "0.8668",
+      "nested_oof_coverage": "0.7143",
+      "nested_oof_ambiguous": 0
+    }
+  }
+}

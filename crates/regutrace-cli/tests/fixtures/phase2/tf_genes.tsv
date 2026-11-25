@@ -1,0 +1,6 @@
+gene_id	tf_symbol	family	identification_status	source	evidence_json
+G1	G1	A	identified	test	[{"protein_id":"P1","domains":[{"model_name":"PF00000","protein_start":3,"protein_end":12,"domain_score":50.0}]}]
+G2	G2	A	identified	test	[{"protein_id":"P2","domains":[{"model_name":"PF00000","protein_start":3,"protein_end":12,"domain_score":45.0}]}]
+G3	G3	B	identified	test	[{"protein_id":"P3","domains":[{"model_name":"PF00001","protein_start":3,"protein_end":12,"domain_score":55.0}]}]
+G4	G4	C	identified	test	[{"protein_id":"P4","domains":[{"model_name":"PF00000","protein_start":3,"protein_end":12,"domain_score":40.0}]}]
+G5	G5	A	identified	test	[{"protein_id":"P5","domains":[{"model_name":"PF00000","protein_start":3,"protein_end":12,"domain_score":42.0}]}]

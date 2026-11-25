@@ -1,0 +1,11 @@
+{
+  "version": "plant-dbd-exploratory-v1",
+  "calibration_status": "uncalibrated",
+  "source": "Engineering placeholder for pipeline validation only. No family-specific DBD identity or coverage calibration has been performed for this pack. Mappings produced with this config are exploratory and must not be presented as validated TF-target evidence.",
+  "defaults": {
+    "min_identity": 50.0,
+    "min_coverage": 0.7,
+    "max_evalue": 1e-5,
+    "source": "engineering placeholder; uncalibrated"
+  }
+}

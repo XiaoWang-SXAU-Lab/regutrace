@@ -5,6 +5,7 @@ use std::io::{BufRead, BufReader};
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
+use sha2::{Digest, Sha256};
 
 use crate::fasta::open_reader;
 
@@ -169,6 +170,24 @@ pub fn read_jaspar(path: &Path) -> Result<Vec<Pwm>> {
 }
 
 impl Pwm {
+    /// Stable content hash of the normalized probability matrix.
+    ///
+    /// The identifier and name are deliberately excluded: two motif records
+    /// with different accessions but an identical matrix are the same scan
+    /// job. Floating-point bits are hashed exactly, so "exact" reuse never
+    /// silently merges merely similar matrices.
+    pub fn digest(&self) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(b"regutrace-pwm-matrix-v1\0");
+        hasher.update((self.matrix.len() as u64).to_le_bytes());
+        for row in &self.matrix {
+            for value in row {
+                hasher.update(value.to_bits().to_le_bytes());
+            }
+        }
+        format!("{:x}", hasher.finalize())
+    }
+
     pub fn log_odds(&self, background: &[f64; 4]) -> Vec<[f64; 4]> {
         self.matrix
             .iter()

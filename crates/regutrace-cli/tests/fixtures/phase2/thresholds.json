@@ -1,0 +1,17 @@
+{
+  "version": "test-thresholds-v1",
+  "calibration_status": "uncalibrated",
+  "source": "synthetic test only; explicitly exploratory",
+  "families": {
+    "A": {
+      "min_identity": 60.0,
+      "min_coverage": 0.8,
+      "max_evalue": 1e-05
+    },
+    "B": {
+      "min_identity": 60.0,
+      "min_coverage": 0.8,
+      "max_evalue": 1e-05
+    }
+  }
+}

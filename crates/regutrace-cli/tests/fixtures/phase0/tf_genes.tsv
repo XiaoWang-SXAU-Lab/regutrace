@@ -1,0 +1,10 @@
+gene_id	tf_symbol	family	identification_status	source
+G_MAPPED	MAPPED	A	identified	test
+G_TIED	TIED	A	identified	test
+G_NODONOR	NODONOR	B	identified	test
+G_NOBLAST	NOBLAST	A	identified	test
+G_BELOW	BELOW	A	identified	test
+G_NONRECIP	NONRECIP	A	identified	test
+G_FAMILY	FAMILY	C	identified	test
+G_AMB	AMB	A	ambiguous	test
+G_REJ	REJ	A	rejected	test

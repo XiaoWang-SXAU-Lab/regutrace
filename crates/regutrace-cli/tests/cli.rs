@@ -573,3 +573,440 @@ TF1\tTF1\tG2\tGENE2\tprediction_motif\tD\tjaspar_pwm\tpromoter_scan\t\t\t300\t40
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+#[test]
+fn phase0_mapping_diagnostics_are_auditable() {
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/phase0");
+    let dir = std::env::temp_dir().join(format!(
+        "regutrace_phase0_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let map = dir.join("tf_map.tsv");
+    let diagnostics = dir.join("mapping-diagnostics.tsv");
+    let families = dir.join("mapping-diagnostics.family.tsv");
+    let bin = env!("CARGO_BIN_EXE_regutrace");
+    let result = Command::new(bin)
+        .args([
+            "map-tf-motifs",
+            "--tf-genes",
+            fixture.join("tf_genes.tsv").to_str().unwrap(),
+            "--reference-map",
+            fixture.join("reference-map.tsv").to_str().unwrap(),
+            "--forward",
+            fixture.join("forward.tsv").to_str().unwrap(),
+            "--reverse",
+            fixture.join("reverse.tsv").to_str().unwrap(),
+            "--out",
+            map.to_str().unwrap(),
+            "--diagnostics-out",
+            diagnostics.to_str().unwrap(),
+            "--diagnostics-family-out",
+            families.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+
+    let diagnostics = std::fs::read_to_string(diagnostics).unwrap();
+    let row = |id: &str| {
+        diagnostics
+            .lines()
+            .find(|line| line.starts_with(&format!("{id}\t")))
+            .unwrap_or_else(|| panic!("missing diagnostic row {id}"))
+            .split('\t')
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(row("G_MAPPED")[5], "MAPPED");
+    assert_eq!(row("G_TIED")[5], "MAPPED_TIED");
+    assert_eq!(row("G_NODONOR")[5], "NO_REFERENCE_DONOR");
+    assert_eq!(row("G_NOBLAST")[5], "NO_BLAST_HIT");
+    assert_eq!(row("G_BELOW")[5], "BELOW_IDENTITY_OR_COVERAGE");
+    assert_eq!(row("G_NONRECIP")[5], "NOT_RECIPROCAL_BEST");
+    assert_eq!(row("G_FAMILY")[5], "NO_REFERENCE_DONOR");
+    assert!(row("G_FAMILY")[6].contains("FAMILY_MISMATCH"));
+    assert_eq!(row("G_AMB")[5], "AMBIGUOUS_EXCLUDED");
+    assert_eq!(row("G_REJ")[5], "REJECTED_EXCLUDED");
+
+    let family_text = std::fs::read_to_string(families).unwrap();
+    let family = |name: &str| {
+        family_text
+            .lines()
+            .find(|line| line.starts_with(&format!("{name}\t")))
+            .unwrap_or_else(|| panic!("missing family row {name}"))
+            .split('\t')
+            .collect::<Vec<_>>()
+    };
+    let a = family("A");
+    assert_eq!(a[1], "7");
+    assert_eq!(a[2], "5");
+    assert_eq!(a[5], "2");
+    assert_eq!(a[7], "3");
+    let reason_total: usize = a[10..].iter().map(|v| v.parse::<usize>().unwrap()).sum();
+    assert_eq!(reason_total, 3, "{a:?}");
+    assert_eq!(family("B")[10], "1");
+    assert_eq!(family("C")[10], "1");
+    assert!(!map.as_os_str().is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn registry_inspect_accepts_legacy_pack_and_writes_summary() {
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/phase0");
+    let dir = std::env::temp_dir().join(format!(
+        "regutrace_registry_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::copy(fixture.join("reference-map.tsv"), dir.join("reference-map.tsv")).unwrap();
+    write(
+        &dir.join("manifest.json"),
+        "{\"pack_version\":\"test-pack-1\",\"species\":\"synthetic\",\
+         \"files\":{\"reference_map\":\"reference-map.tsv\"}}",
+    );
+    write(
+        &dir.join("motifs.txt"),
+        ">MA1 a\nA [ 1 0 ]\nC [ 0 1 ]\nG [ 0 0 ]\nT [ 0 0 ]\n\
+>MA2 b\nA [ 1 0 ]\nC [ 0 1 ]\nG [ 0 0 ]\nT [ 0 0 ]\n\
+>MA3 c\nA [ 0 1 ]\nC [ 0 1 ]\nG [ 1 0 ]\nT [ 1 0 ]\n\
+>MA4 d\nA [ 1 1 ]\nC [ 0 0 ]\nG [ 0 0 ]\nT [ 0 0 ]\n",
+    );
+    let registry = dir.join("registry.tsv");
+    let summary = dir.join("summary.json");
+    let bin = env!("CARGO_BIN_EXE_regutrace");
+    let result = Command::new(bin)
+        .args([
+            "registry",
+            "inspect",
+            "--reference-pack",
+            dir.to_str().unwrap(),
+            "--out",
+            registry.to_str().unwrap(),
+            "--summary-json",
+            summary.to_str().unwrap(),
+            "--motif-library",
+            dir.join("motifs.txt").to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let text = std::fs::read_to_string(&registry).unwrap();
+    let rows: Vec<_> = text.lines().collect();
+    assert_eq!(rows.len(), 4, "{text}");
+    assert!(rows[0].starts_with("motif_id\tdonor_id\tfamily\tsource"));
+    assert!(rows[1].contains("\tD1\tA\tlegacy-pack\ttest-pack-1\t"), "{}", rows[1]);
+    let summary: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&summary).unwrap()).unwrap();
+    assert_eq!(summary["records"], 3);
+    assert_eq!(summary["unique_motifs"], 3);
+    assert_eq!(summary["unique_donors"], 3);
+    assert_eq!(summary["missing_dbd"], 3);
+    assert_eq!(summary["qc_status"]["legacy_unverified"], 3);
+    assert_eq!(summary["donor_species"]["synthetic"], 3);
+    assert_eq!(summary["families"][0]["family"], "A");
+    assert_eq!(summary["library"]["motifs"], 4);
+    assert_eq!(summary["library"]["library_unmapped"], 1);
+    assert_eq!(summary["library"]["duplicate_group_count"], 1);
+    assert_eq!(summary["library"]["duplicate_motif_count"], 2);
+    let unknown = Command::new(bin)
+        .args(["registry", "bogus", "--out", registry.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(!unknown.status.success());
+    assert!(String::from_utf8_lossy(&unknown.stderr).contains("unknown registry command"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn phase2_dbd_extract_and_mapping_are_auditable() {
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/phase2");
+    let dir = std::env::temp_dir().join(format!(
+        "regutrace_phase2_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let bin = env!("CARGO_BIN_EXE_regutrace");
+    let local_faa = dir.join("local-dbd.faa");
+    let local_tsv = dir.join("local-dbd.tsv");
+    let extracted = Command::new(bin)
+        .args([
+            "dbd-extract",
+            "--tf-genes",
+            fixture.join("tf_genes.tsv").to_str().unwrap(),
+            "--proteins",
+            fixture.join("proteins.faa").to_str().unwrap(),
+            "--dbd-models",
+            fixture.join("dbd-models.json").to_str().unwrap(),
+            "--out-faa",
+            local_faa.to_str().unwrap(),
+            "--out-tsv",
+            local_tsv.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        extracted.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&extracted.stderr)
+    );
+    let fasta = std::fs::read_to_string(&local_faa).unwrap();
+    assert_eq!(fasta.matches('>').count(), 4, "{fasta}");
+    assert!(fasta.contains(">G1\nACGTACGTAC\n"), "{fasta}");
+    let table = std::fs::read_to_string(&local_tsv).unwrap();
+    assert_eq!(table.lines().count(), 5);
+    let g1 = table
+        .lines()
+        .find(|line| line.starts_with("G1\t"))
+        .unwrap()
+        .split('\t')
+        .collect::<Vec<_>>();
+    assert_eq!(g1[4], "3");
+    assert_eq!(g1[5], "12");
+    assert_eq!(g1[6], "1");
+    assert_eq!(g1[7], "full_architecture");
+
+    let map = dir.join("dbd-map.tsv");
+    let diagnostics = dir.join("dbd-diagnostics.tsv");
+    let mapped = Command::new(bin)
+        .args([
+            "map-dbd-motifs",
+            "--tf-genes",
+            fixture.join("tf_genes.tsv").to_str().unwrap(),
+            "--proteins",
+            fixture.join("proteins.faa").to_str().unwrap(),
+            "--dbd-models",
+            fixture.join("dbd-models.json").to_str().unwrap(),
+            "--reference-map",
+            fixture.join("reference-map.tsv").to_str().unwrap(),
+            "--donor-dbd",
+            fixture.join("donor-dbd.tsv").to_str().unwrap(),
+            "--donor-dbd-faa",
+            fixture.join("donor-dbd.faa").to_str().unwrap(),
+            "--threshold-config",
+            fixture.join("thresholds.json").to_str().unwrap(),
+            "--allow-uncalibrated",
+            "true",
+            "--dbd-alignments",
+            fixture.join("dbd-alignments.tsv").to_str().unwrap(),
+            "--out",
+            map.to_str().unwrap(),
+            "--diagnostics-out",
+            diagnostics.to_str().unwrap(),
+            "--reference-pack-version",
+            "test-pack",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        mapped.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&mapped.stderr)
+    );
+    let map_text = std::fs::read_to_string(&map).unwrap();
+    let rows = map_text
+        .lines()
+        .skip(1)
+        .map(|line| line.split('\t').collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+    assert_eq!(rows.len(), 3, "{map_text}");
+    assert_eq!(rows.iter().filter(|row| row[0] == "G1").count(), 2);
+    assert_eq!(rows.iter().filter(|row| row[0] == "G3").count(), 1);
+    let g1_rows = rows.iter().filter(|row| row[0] == "G1").collect::<Vec<_>>();
+    assert!(g1_rows.iter().all(|row| row[11] == "dbd_exploratory"));
+    assert!(g1_rows.iter().all(|row| row[32] == "multiple_donors_and_motifs"));
+    assert!(g1_rows.iter().all(|row| row[33] == "DBD_TRANSFER_AMBIGUOUS"));
+    assert!(g1_rows.iter().all(|row| row[34] == "test-pack"));
+    let g3 = rows.iter().find(|row| row[0] == "G3").unwrap();
+    assert_eq!(g3[11], "dbd_exploratory");
+    assert_eq!(g3[32], "unique");
+    assert_eq!(g3[33], "DBD_TRANSFER");
+
+    let diagnostic_text = std::fs::read_to_string(&diagnostics).unwrap();
+    let reason = |id: &str| {
+        diagnostic_text
+            .lines()
+            .find(|line| line.starts_with(&format!("{id}\t")))
+            .unwrap_or_else(|| panic!("missing diagnostic for {id}"))
+            .split('\t')
+            .collect::<Vec<_>>()[5]
+            .to_owned()
+    };
+    assert_eq!(reason("G1"), "DBD_EXPLORATORY");
+    assert_eq!(reason("G2"), "BELOW_DBD_THRESHOLD");
+    assert_eq!(reason("G3"), "DBD_EXPLORATORY");
+    assert_eq!(reason("G4"), "NO_DBD_SEQUENCE");
+    assert_eq!(reason("G5"), "NO_BLAST_HIT");
+    let g1_diag = diagnostic_text
+        .lines()
+        .find(|line| line.starts_with("G1\t"))
+        .unwrap()
+        .split('\t')
+        .collect::<Vec<_>>();
+    assert_eq!(g1_diag[12], "2");
+    assert_eq!(g1_diag[13], "D1");
+    assert_eq!(g1_diag[14], "90.0000");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn phase2_5_calibrated_mapping_uses_reciprocity_and_specificity_groups() {
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/phase2");
+    let dir = std::env::temp_dir().join(format!(
+        "regutrace_phase2_5_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let bin = env!("CARGO_BIN_EXE_regutrace");
+    let map = dir.join("calibrated-map.tsv");
+    let diagnostics = dir.join("calibrated-diagnostics.tsv");
+    let output = Command::new(bin)
+        .args([
+            "map-dbd-motifs",
+            "--tf-genes",
+            fixture.join("tf_genes.tsv").to_str().unwrap(),
+            "--proteins",
+            fixture.join("proteins.faa").to_str().unwrap(),
+            "--dbd-models",
+            fixture.join("dbd-models.json").to_str().unwrap(),
+            "--reference-map",
+            fixture.join("reference-map.tsv").to_str().unwrap(),
+            "--donor-dbd",
+            fixture.join("donor-dbd.tsv").to_str().unwrap(),
+            "--donor-dbd-faa",
+            fixture.join("donor-dbd.faa").to_str().unwrap(),
+            "--threshold-config",
+            fixture.join("thresholds-calibrated.json").to_str().unwrap(),
+            "--specificity-groups",
+            fixture.join("specificity-groups.tsv").to_str().unwrap(),
+            "--require-reciprocal-dbd",
+            "true",
+            "--dbd-alignments",
+            fixture.join("dbd-alignments.tsv").to_str().unwrap(),
+            "--reverse-dbd-alignments",
+            fixture.join("reverse-dbd-alignments.tsv").to_str().unwrap(),
+            "--out",
+            map.to_str().unwrap(),
+            "--diagnostics-out",
+            diagnostics.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let map_text = std::fs::read_to_string(&map).unwrap();
+    let rows = map_text
+        .lines()
+        .skip(1)
+        .map(|line| line.split('\t').collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+    assert_eq!(rows.len(), 3);
+    assert!(rows.iter().all(|row| row[10] == "calibrated"));
+    assert!(rows.iter().all(|row| row[11] == "dbd_calibrated"));
+    assert!(rows.iter().all(|row| row[12] == "yes"));
+    let g1 = rows.iter().filter(|row| row[0] == "G1").collect::<Vec<_>>();
+    assert_eq!(g1.len(), 2);
+    assert!(g1.iter().all(|row| row[13] == "A1"));
+    assert!(g1.iter().all(|row| row[14] == "1"));
+    let g3 = rows.iter().find(|row| row[0] == "G3").unwrap();
+    assert_eq!(g3[13], "B1");
+    assert_eq!(g3[33], "DBD_CALIBRATED");
+    let diagnostic_text = std::fs::read_to_string(&diagnostics).unwrap();
+    let reason = |id: &str| {
+        diagnostic_text
+            .lines()
+            .find(|line| line.starts_with(&format!("{id}\t")))
+            .unwrap()
+            .split('\t')
+            .collect::<Vec<_>>()[5]
+            .to_owned()
+    };
+    assert_eq!(reason("G1"), "DBD_CALIBRATED");
+    assert_eq!(reason("G3"), "DBD_CALIBRATED");
+
+    let missing_groups = Command::new(bin)
+        .args([
+            "map-dbd-motifs",
+            "--tf-genes",
+            fixture.join("tf_genes.tsv").to_str().unwrap(),
+            "--proteins",
+            fixture.join("proteins.faa").to_str().unwrap(),
+            "--dbd-models",
+            fixture.join("dbd-models.json").to_str().unwrap(),
+            "--reference-map",
+            fixture.join("reference-map.tsv").to_str().unwrap(),
+            "--donor-dbd",
+            fixture.join("donor-dbd.tsv").to_str().unwrap(),
+            "--donor-dbd-faa",
+            fixture.join("donor-dbd.faa").to_str().unwrap(),
+            "--threshold-config",
+            fixture.join("thresholds-calibrated.json").to_str().unwrap(),
+            "--dbd-alignments",
+            fixture.join("dbd-alignments.tsv").to_str().unwrap(),
+            "--out",
+            dir.join("should-not-exist.tsv").to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!missing_groups.status.success());
+    assert!(
+        String::from_utf8_lossy(&missing_groups.stderr).contains("requires --specificity-groups")
+    );
+    let missing_reciprocal = Command::new(bin)
+        .args([
+            "map-dbd-motifs",
+            "--tf-genes",
+            fixture.join("tf_genes.tsv").to_str().unwrap(),
+            "--proteins",
+            fixture.join("proteins.faa").to_str().unwrap(),
+            "--dbd-models",
+            fixture.join("dbd-models.json").to_str().unwrap(),
+            "--reference-map",
+            fixture.join("reference-map.tsv").to_str().unwrap(),
+            "--donor-dbd",
+            fixture.join("donor-dbd.tsv").to_str().unwrap(),
+            "--donor-dbd-faa",
+            fixture.join("donor-dbd.faa").to_str().unwrap(),
+            "--threshold-config",
+            fixture.join("thresholds-calibrated.json").to_str().unwrap(),
+            "--specificity-groups",
+            fixture.join("specificity-groups.tsv").to_str().unwrap(),
+            "--dbd-alignments",
+            fixture.join("dbd-alignments.tsv").to_str().unwrap(),
+            "--out",
+            dir.join("should-not-exist-2.tsv").to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!missing_reciprocal.status.success());
+    assert!(
+        String::from_utf8_lossy(&missing_reciprocal.stderr)
+            .contains("requires --require-reciprocal-dbd")
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

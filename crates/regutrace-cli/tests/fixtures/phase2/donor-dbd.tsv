@@ -1,0 +1,4 @@
+sequence_id	gene_id	family	models	dbd_start	dbd_end	domain_count	mode	score	sequence_sha256	sequence_length
+D1	D1	A	PF00000	5	14	1	full_architecture	50.0	sha256:6612c0e673bc5b6636f9147556b461347642dcde65d5bc6b39e209d2b6b95af1	10
+D2	D2	A	PF00000	5	14	1	full_architecture	50.0	sha256:9efd60545cac170db3f9718b45f5eab615dbcbcdf9c9ad45fb8d57dcd25d2182	10
+D3	D3	B	PF00001	5	14	1	full_architecture	50.0	sha256:e8ff5b98ab68aa260e92f38aa31c990f6bae9e5549e62bfea5013c9be4e928ec	10

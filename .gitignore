@@ -4,3 +4,6 @@
 **/*.db-wal
 /data/
 *.partial
+
+__pycache__/
+*.pyc

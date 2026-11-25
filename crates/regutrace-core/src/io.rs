@@ -426,6 +426,19 @@ impl EdgeStream {
         write_edge_record(&mut self.wtr, e)
     }
 
+    /// Open an existing edge table for appending without writing a second
+    /// header. Used when a streamed scan is followed by user-curated rows.
+    pub fn append(path: &Path) -> Result<Self> {
+        let file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(path)
+            .with_context(|| format!("open {} for append", path.display()))?;
+        let wtr = WriterBuilder::new()
+            .delimiter(b'\t')
+            .from_writer(BufWriter::new(file));
+        Ok(Self { wtr })
+    }
+
     pub fn flush(&mut self) -> Result<()> {
         self.wtr.flush()?;
         Ok(())

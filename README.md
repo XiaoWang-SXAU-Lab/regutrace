@@ -189,10 +189,14 @@ regutrace pipeline \
   --threads 4
 ```
 
-Outputs in `run/plant/`: `tf_genes.tsv`, `tf_map.tsv`, `evidence.tsv`,
+Outputs in `run/plant/`: `tf_genes.tsv`, `tf_map.tsv`,
+`mapping-diagnostics.tsv`, `mapping-diagnostics.family.tsv`, `evidence.tsv`,
 `evidence.db`, `promoters.fa`, `progress.json`, `scan-report.json`,
 `pipeline-report.json`, and three small derived trace tables:
-`tf_motif_trace.tsv`, `motif_ambiguity.tsv` and `target_candidate_ties.tsv`. `evidence.db` uses the `hits`/`pairs` schema
+`tf_motif_trace.tsv`, `motif_ambiguity.tsv` and `target_candidate_ties.tsv`. The
+mapping diagnostics explain each catalogue TF's mapped/unmapped state and give
+per-family reason counts; they do not change strict `tf_map.tsv` semantics.
+`evidence.db` uses the `hits`/`pairs` schema
 expected by `validate-db` and `prior`. The pipeline report lists the TF
 catalogue (including ambiguous/rejected counts), mapped/fallback counts,
 retained/excluded rows, `scanned_without_hits` (actually scanned motifs with no
@@ -204,6 +208,132 @@ actually scanned motif, the report and console warn, but the scan continues
 with the user-supplied threshold. `scan.gene_biotype` records whether a
 requested biotype filter was requested, whether it came from the user or pack
 default, and whether it was actually applied or skipped.
+
+### Registry inspection and pack validation
+
+`registry inspect` exports a versioned provenance table for a reference pack or
+an existing registry TSV. It verifies manifest checksums, donor-sequence
+checksums, duplicate keys and DBD coordinates, and can check the registry
+against the packaged PWM library:
+
+```bash
+regutrace registry inspect \
+  --reference-pack reference-packs/plant-jaspar-2024-rbh \
+  --motif-library reference-packs/plant-jaspar-2024-rbh/motifs/JASPAR2024_CORE_plants.txt \
+  --out plant.registry.tsv \
+  --summary-json plant.registry-summary.json
+```
+
+The current plant pack is marked `legacy_unverified`: its 615 donor records
+have per-donor sequence checksums and species, but no license or DBD
+coordinates. The motif library is the official JASPAR 2024 CORE plants file.
+JASPAR 2026 and CIS-BP are not integrated by default yet. A candidate
+JASPAR 2026 pack can be built with `scripts/fetch-jaspar-metadata.py` and
+`scripts/build-jaspar-2026-audit.py`; the build and HF1 comparison are recorded
+in [docs/development/phase1-report.md](docs/development/phase1-report.md). The
+2024 pack remains the default until target-level benchmarking.
+
+### Exploratory DBD-based transfer
+
+The strict plant workflow transfers a representative motif by full-protein
+reciprocal best hits. Phase 2 adds an independent, explicitly exploratory path
+that extracts DNA-binding domains and aligns them directly:
+
+```bash
+regutrace dbd-extract \
+  --tf-genes tf_genes.tsv \
+  --proteins proteins.faa \
+  --dbd-models config/dbd-models/plant-v1.json \
+  --out-faa local-dbd.faa \
+  --out-tsv local-dbd.tsv
+
+regutrace map-dbd-motifs \
+  --tf-genes tf_genes.tsv \
+  --proteins proteins.faa \
+  --dbd-models config/dbd-models/plant-v1.json \
+  --reference-map reference-pack/reference-map.tsv \
+  --donor-dbd donor-dbd.tsv \
+  --donor-dbd-faa donor-dbd.faa \
+  --threshold-config config/dbd-thresholds/exploratory-v1.json \
+  --allow-uncalibrated true \
+  --reference-pack-version plant-jaspar-2024-rbh \
+  --out tf_map.dbd.tsv \
+  --diagnostics-out tf_map.dbd.diagnostics.tsv
+```
+
+`map-dbd-motifs` keeps every eligible donor instead of choosing the first one,
+writes extra provenance columns, and labels rows
+`mapping_confidence=exploratory_uncalibrated`. The threshold config is not a
+validated calibration; the command refuses to run without
+`--allow-uncalibrated true`. `tf_map.tsv` and the default pipeline are
+unchanged. See
+[docs/development/phase2-report.md](docs/development/phase2-report.md).
+
+A Phase 2.5 calibrated threshold config is available for the two families that
+passed nested species-grouped validation (`HD-ZIP`, `TCP`):
+
+```bash
+regutrace map-dbd-motifs \
+  ... \
+  --threshold-config config/dbd-thresholds/plant-calibrated-v1.json \
+  --specificity-groups motif-specificity-groups.tsv \
+  --require-reciprocal-dbd true \
+  --out tf_map.dbd-calibrated.tsv
+```
+
+Rows are labelled `dbd_calibrated`, `dbd_ambiguous`, `dbd_exploratory` or
+`no_supported_motif`. Families without a calibrated threshold return
+`NO_CALIBRATED_THRESHOLD`; they are not assigned an arbitrary threshold. See
+[docs/development/phase2.5-report.md](docs/development/phase2.5-report.md).
+
+Phase 2.6 compared reciprocal and non-reciprocal DBD strategies. Reciprocity
+raises precision but lowers coverage; no non-reciprocal strategy met the 0.90
+precision target under homology-cluster-held-out validation. The strict and
+Phase 2.5 calibrated modes remain the defaults. See
+[docs/development/phase2.6-report.md](docs/development/phase2.6-report.md).
+
+Phase 3 separated unique PWM sites from TF evidence rows and added an opt-in
+scan architecture. The legacy path remains the default; the new path is enabled
+by any of `--reuse-exact-pwm`, `--scan-cache`, `--sites-out`,
+`--motif-testability-out`, `--promoter-summary-out`, `--scan-manifest` or
+`--background-mode empirical`:
+
+```bash
+regutrace scan \
+  --genome genome.fa --gff annotation.gff3 --motifs jaspar_plants.txt \
+  --tf-map tf_map.tsv --tf-genes tf_genes.tsv \
+  --promoter-len 1000 --pvalue 1e-4 --threads 8 \
+  --reuse-exact-pwm --scan-cache scan-cache \
+  --sites-out sites.tsv --motif-testability-out testability.tsv \
+  --promoter-summary-out promoter-summary.tsv \
+  --scan-manifest scan-manifest.json --out evidence.tsv
+```
+
+`--sites-out` writes one row per bit-identical PWM group and site; the evidence
+table still has one row per TF × motif × site for compatibility. The manifest
+records the promoter-set hash, background, cache hits/misses and testability
+counts. `--background-mode empirical` estimates a strand-symmetric zero-order
+promoter background with pseudocount 1; it is not the default because it changes
+the null and the hit set. `--motif-testability-out` reports exact attainable
+p-value floors and never silently lowers the threshold. No site/promoter FDR is
+claimed. On HF1, legacy and optimized evidence were full-row identical, peak
+memory fell from 3,308 to 454 MiB, and warm-cache scans were 5–6.5× faster. See
+[docs/development/phase3-report.md](docs/development/phase3-report.md).
+
+The pipeline accepts `--reuse-exact-pwm`, `--phase3-artifacts`,
+`--scan-cache <dir>` and `--background-mode uniform|empirical`.
+
+Exploratory motif enrichment over user GMTs is available:
+
+```bash
+regutrace enrich \
+  --sites motif-site-hits.tsv --promoter-summary promoter-summary.tsv \
+  --gene-sets sets.gmt --out enrichment.tsv
+```
+
+It is a one-sided Fisher/BH test on a binary promoter-hit matrix over the
+scanned universe; it is not a calibrated regulatory enrichment model. See
+[docs/development/phase3-enrichment-design.md](docs/development/phase3-enrichment-design.md).
 
 ### Traceability from TF to motif to target to site
 
@@ -382,9 +512,10 @@ context and suggestions for frontends and RAG assistants; see
 A whole-genome scan with hundreds of motifs can emit millions of rows. Add
 `--stream` to write the evidence TSV incrementally instead of retaining every
 row in memory (rows are in scan order, not sorted), and `--progress-json` to
-publish stage/progress for a frontend. Scanning is parallel by default, using
-`CPU cores - 1` worker threads; set `--threads N` explicitly or `--threads 1`
-for serial execution:
+publish stage/progress for a frontend. The Phase 3 path (`--reuse-exact-pwm`,
+`--sites-out`, `--scan-cache`, etc.) always streams per PWM group and does not
+need `--stream`. Scanning is parallel by default, using `CPU cores - 1` worker
+threads; set `--threads N` explicitly or `--threads 1` for serial execution:
 
 ```bash
 regutrace scan \
