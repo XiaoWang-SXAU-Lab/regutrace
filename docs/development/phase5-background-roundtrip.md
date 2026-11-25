@@ -29,7 +29,7 @@ sha256   f515861759b481343177fa6bb9656a315f781a743d9313bb2a0513cfbde4e622
 | `hits` | 0 | canonical schema required by `validate-db`; site-only runs do not materialize evidence rows |
 | `meta` | — | schema v2, policy, counts, checksums, limitations |
 
-The canonical `pairs` table is the rsWGCNA import contract. The normalized testability/promoter/scan layers were added without rebuilding the site table. The 25M exploratory TF–target union is **not** materialized; `motif_target` + `tf_motif` preserve the broader evidence for advanced joins.
+The canonical `pairs` table is the rsWGCNA import contract. The normalized testability/promoter/scan layers were added without rebuilding the site table. The project-import timings above were measured before the v2 layers were appended; `validate-db` and standalone prior queries were re-run on the v2 DB and pass. The `hits`/`pairs` contract is unchanged. The 25M exploratory TF–target union is **not** materialized; `motif_target` + `tf_motif` preserve the broader evidence for advanced joins.
 
 ## 3. Round-trip steps actually performed
 
