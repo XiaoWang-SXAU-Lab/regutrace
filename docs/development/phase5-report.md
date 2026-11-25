@@ -11,6 +11,7 @@ Supporting records:
 - [phase5-target-benchmark.md](phase5-target-benchmark.md)
 - [phase5-statistics.md](phase5-statistics.md)
 - [phase5-decisions.md](phase5-decisions.md)
+- [phase5-audit-report.html](phase5-audit-report.html) — self-contained audit report (HTML; PDF also in sync `docs/`)
 
 Machine-readable results are under `%LOCALAPPDATA%\rsWGCNA-build\phase5\` and in the sync package described below.
 
