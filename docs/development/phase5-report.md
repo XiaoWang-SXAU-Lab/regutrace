@@ -96,8 +96,8 @@ A standalone SQLite background was built from the HF1 site-only job and the coor
 | Item | Value |
 |---|---:|
 | File | `hf1-background.db` |
-| Size | 1,375,219,712 bytes (1.28 GiB) |
-| SHA-256 | `6b0348250f8365f5c465a10a2e790d2933703752d508a8108e8b6b8504a54629` |
+| Size | 1,382,932,480 bytes (1.29 GiB) |
+| SHA-256 | `f515861759b481343177fa6bb9656a315f781a743d9313bb2a0513cfbde4e622` |
 | TF catalogue | 1,981 rows (1,907 identified + 74 ambiguous) |
 | TF–motif rows | 32,792 (27,720 with query DBD coordinates; 1,089 TFs) |
 | Motif–target associations | 4,644,497 |
@@ -105,6 +105,7 @@ A standalone SQLite background was built from the HF1 site-only job and the coor
 | Distinct TF with pairs | 991 |
 | Distinct motifs in mapping / with targets | 679 / 614 |
 | Target union | 37,415 |
+| Normalized layers | motif_testability 927; promoter 37,415; scan_config 13 |
 | Build wall time | ~180 s |
 | Observed build working set | ~244 MB |
 | Dashboard peak working set during import | ~22 MB (validator child excluded) |
@@ -227,6 +228,7 @@ New Phase 5 scripts are reproducible from the documented inputs. The analysis do
 - scripts:
   - `scripts/phase5/aggregate_audit.py`
   - `scripts/phase5/build_background.py`
+  - `scripts/phase5/add_background_layers.py`
   - `scripts/phase5/benchmark_dap.py`
   - `scripts/phase5/null_shuffle.py`
 

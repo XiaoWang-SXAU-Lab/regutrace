@@ -10,8 +10,8 @@ HF1 artifact:
 
 ```
 %LOCALAPPDATA%\rsWGCNA-build\phase5\background\hf1-background.db
-bytes    1,375,219,712
-sha256   6b0348250f8365f5c465a10a2e790d2933703752d508a8108e8b6b8504a54629
+bytes    1,382,932,480
+sha256   f515861759b481343177fa6bb9656a315f781a743d9313bb2a0513cfbde4e622
 ```
 
 ## 2. Schema
@@ -22,11 +22,14 @@ sha256   6b0348250f8365f5c465a10a2e790d2933703752d508a8108e8b6b8504a54629
 | `tf_motif` | 32,792 | strict/calibrated/exploratory mapping; coordinates and provenance when available |
 | `motif_target` | 4,644,497 | aggregated motif–target associations (n_sites, best p/score) |
 | `motif_registry` | 805 | motif name, length, PWM hash, specificity group, source |
+| `motif_testability` | 927 | attainable p, requested p, status, hit/mapped counts |
+| `promoter` | 37,415 | per-promoter scan/testability/site aggregation |
+| `scan_config` | 13 | scan parameters, background, cache and runtime |
 | `pairs` | 7,394,435 | policy-selected TF–target prior (best-supported per DBD group) |
 | `hits` | 0 | canonical schema required by `validate-db`; site-only runs do not materialize evidence rows |
-| `meta` | — | schema, policy, counts, checksums, limitations |
+| `meta` | — | schema v2, policy, counts, checksums, limitations |
 
-The canonical `pairs` table is the rsWGCNA import contract. The 25M exploratory TF–target union is **not** materialized; `motif_target` + `tf_motif` preserve the broader evidence for advanced joins.
+The canonical `pairs` table is the rsWGCNA import contract. The normalized testability/promoter/scan layers were added without rebuilding the site table. The 25M exploratory TF–target union is **not** materialized; `motif_target` + `tf_motif` preserve the broader evidence for advanced joins.
 
 ## 3. Round-trip steps actually performed
 
@@ -66,7 +69,7 @@ The canonical `pairs` table is the rsWGCNA import contract. The 25M exploratory 
 | Project import (upload + validation) | 61.3 s |
 | Standalone prior query | 1.03 s |
 
-The build reads the 1.9 GB site TSV once. The database is 1.28 GiB; the WAL and temporary files require additional free space.
+The build reads the 1.9 GB site TSV once. The database is 1.29 GiB; the WAL and temporary files require additional free space.
 
 ## 6. Backward compatibility and failure handling
 

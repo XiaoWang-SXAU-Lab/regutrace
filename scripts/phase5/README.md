@@ -4,6 +4,7 @@ Reproducible analysis and background export. These do not alter the scanner defa
 
 - `aggregate_audit.py` — coordinate-aware grouping, best/representative/all policies, site-level and promoter-level BH, coverage and target counts.
 - `build_background.py` — standalone SQLite background (`tf_catalogue`, `tf_motif`, `motif_target`, `motif_registry`, canonical `hits`/`pairs`).
+- `add_background_layers.py` — adds normalized `motif_testability`, `promoter`, and `scan_config` tables to an existing background DB (schema v2).
 - `benchmark_dap.py` — O'Malley 2016 DAP-seq direct/transferred/empirical benchmark.
 - `null_shuffle.py` — dinucleotide-preserving promoter null.
 - `test_phase5.py` — grouping/overlap/dedup/policy unit checks.
