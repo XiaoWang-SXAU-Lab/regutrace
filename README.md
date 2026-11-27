@@ -293,10 +293,11 @@ Phase 2.5 calibrated modes remain the defaults. See
 [docs/development/phase2.6-report.md](docs/development/phase2.6-report.md).
 
 Phase 3 separated unique PWM sites from TF evidence rows and added an opt-in
-scan architecture. The legacy path remains the default; the new path is enabled
-by any of `--reuse-exact-pwm`, `--scan-cache`, `--sites-out`,
-`--motif-testability-out`, `--promoter-summary-out`, `--scan-manifest` or
-`--background-mode empirical`:
+scan architecture. The new path is enabled by any of `--reuse-exact-pwm`,
+`--scan-cache`, `--sites-out`, `--motif-testability-out`,
+`--promoter-summary-out`, `--scan-manifest` or `--background-mode empirical`; it
+is also the only path that supports the calibrated background, which is now the
+default, so a plain `scan` uses it:
 
 ```bash
 regutrace scan \
@@ -312,16 +313,28 @@ regutrace scan \
 `--sites-out` writes one row per bit-identical PWM group and site; the evidence
 table still has one row per TF × motif × site for compatibility. The manifest
 records the promoter-set hash, background, cache hits/misses and testability
-counts. `--background-mode empirical` estimates a strand-symmetric zero-order
-promoter background with pseudocount 1; it is not the default because it changes
-the null and the hit set. `--motif-testability-out` reports exact attainable
-p-value floors and never silently lowers the threshold. No site/promoter FDR is
-claimed. On HF1, legacy and optimized evidence were full-row identical, peak
-memory fell from 3,308 to 454 MiB, and warm-cache scans were 5–6.5× faster. See
+counts. `--motif-testability-out` reports exact attainable p-value floors and
+never silently lowers the threshold. No site/promoter FDR is claimed. On HF1,
+legacy and optimized evidence were full-row identical, peak memory fell from
+3,308 to 454 MiB, and warm-cache scans were 5–6.5× faster. See
 [docs/development/phase3-report.md](docs/development/phase3-report.md).
 
+**Null model.** The default `--background-mode empirical` fits a
+strand-symmetric zero-order null to the A/C/G/T composition of the scanned
+promoters. This is not a cosmetic choice: a uniform 0.25-per-base null
+mis-calibrates every p-value on species whose promoters are not 25 % each base.
+On HF1 (fitted composition ≈ 67 % AT) the observed per-motif promoter coverage
+correlates with the composition-matched expectation at r = 0.94 but with the
+uniform expectation at only r = 0.24, and an A/T-rich Dof motif such as
+MA1274.1 collects 8.2 bits of score it has not earned — more than half of its
+15.6-bit information content. `--background-mode uniform` remains available to
+reproduce results produced before this default changed; it prints a warning and
+is implied by an explicit `--background`. See
+[docs/development/phase6-null-model.md](docs/development/phase6-null-model.md).
+
 The pipeline accepts `--reuse-exact-pwm`, `--phase3-artifacts`,
-`--scan-cache <dir>` and `--background-mode uniform|empirical`.
+`--scan-cache <dir>` and `--background-mode empirical|uniform` (empirical by
+default).
 
 Exploratory motif enrichment over user GMTs is available:
 

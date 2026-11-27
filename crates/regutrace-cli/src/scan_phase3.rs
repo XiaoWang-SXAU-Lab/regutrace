@@ -1036,6 +1036,20 @@ pub(crate) fn run(
                 "ambiguous_bases": background.ambiguous_bases,
                 "pseudocount_per_base": background.pseudocount,
                 "symmetrized": background.mode.starts_with("empirical"),
+                // A p-value only means something relative to the null it was
+                // computed under. Recorded here so a result can never be read
+                // without knowing which null produced it.
+                "calibrated_to_promoter_composition": background.mode.starts_with("empirical"),
+            },
+            "null_model": {
+                "calibrated": background.mode.starts_with("empirical"),
+                "description": if background.mode.starts_with("empirical") {
+                    "strand-symmetric zero-order null fitted to the scanned promoter A/C/G/T composition"
+                } else {
+                    "uniform i.i.d. null (0.25 per base); p-values are not calibrated to the species base composition"
+                },
+                "chance_coverage_note":
+                    "per motif, the expected share of promoters with at least one hit by chance is 1-(1-p)^(2*(promoter_len-L+1)); at p=1e-4 and 1000 bp that is ~17.8% for every motif length, so per-motif coverage near 18% is the expected chance level, not evidence",
             },
             "thresholds": {
                 "requested_pvalue": args.pvalue,

@@ -89,6 +89,11 @@ AT1G00010\tG2\tpoint_validation_emsa\tA\tEMSA\tPMID:123\t123\n",
             "100",
             "--pvalue",
             "1e-3",
+            // Pinned null. The coordinate expectations below describe the legacy
+            // uniform scan; the default is now the fitted promoter composition,
+            // which admits extra hits and changes which row comes first.
+            "--background-mode",
+            "uniform",
             "--annotation",
             anno_path.to_str().unwrap(),
             "--user-list",
@@ -215,6 +220,10 @@ AT1G00010\tG2\tpoint_validation_emsa\tA\tEMSA\tPMID:123\t123\n",
             "--report-json",
             stream_report.to_str().unwrap(),
             "--stream",
+            // Pinned null: the hit/edge counts asserted below are the legacy
+            // uniform scan's. The default fitted composition admits more hits.
+            "--background-mode",
+            "uniform",
             "--threads",
             "2",
         ])
@@ -1007,6 +1016,242 @@ fn phase2_5_calibrated_mapping_uses_reciprocity_and_specificity_groups() {
     assert!(
         String::from_utf8_lossy(&missing_reciprocal.stderr)
             .contains("requires --require-reciprocal-dbd")
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// A schema-v3 background is a redistribution artifact: it has to state its own
+// scan envelope (p-value, promoter window, source/mapping mode) and must not
+// carry machine-local paths. A failed build must not leave a partial database.
+#[test]
+fn background_records_envelope_and_cleans_up_failed_builds() {
+    use rusqlite::Connection;
+
+    let dir = std::env::temp_dir().join(format!("regutrace_background_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let write = |name: &str, text: &str| -> PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, text).unwrap();
+        path
+    };
+
+    let motifs = write(
+        "motifs.jaspar",
+        ">MA0001.1 TEST\nA [ 10 0 0 0 0 0 ]\nC [ 0 10 0 0 0 0 ]\nG [ 0 0 10 0 0 0 ]\nT [ 0 0 0 10 0 10 ]\n\
+>MA0002.1 OTHER\nA [ 0 10 0 0 0 0 ]\nC [ 10 0 0 0 0 0 ]\nG [ 0 0 0 10 0 0 ]\nT [ 0 0 10 0 10 10 ]\n",
+    );
+    let tf_genes = write(
+        "tf_genes.tsv",
+        "gene_id\ttf_symbol\tfamily\tidentification_status\tsource\nTF1\tTF1\tHSF\tidentified\tpack\n",
+    );
+    let tf_map = write(
+        "tf_map.tsv",
+        "tf_id\ttf_symbol\tfamily\tmotif_id\treference_tf_id\tmapping_method\tdomain_mode\tmapping_status\tspecificity_groups\tquery_full_dbd_start\tquery_full_dbd_end\n\
+TF1\tTF1\tHSF\tMA0001.1\tD1\treciprocal_protein_similarity\twhole_protein\tstrict_rbh\tHSF_T090_001\t10\t100\n\
+TF1\tTF1\tHSF\tMA0002.1\tD2\tdbd_transfer_exploratory\tfull_architecture\tdbd_exploratory\tHSF_T090_002\t10\t100\n",
+    );
+    // The scan is a Windows run: the manifest carries an absolute path that the
+    // exported scan_config must reduce to a library identity.
+    let manifest = write(
+        "scan-manifest.json",
+        "{\"thresholds\":{\"requested_pvalue\":0.0001},\
+\"inputs\":{\"motifs\":\"C:/Users/somebody/packs/plant-jaspar/motifs/JASPAR2024_CORE_plants.txt\"},\
+\"background\":{\"mode\":\"uniform\",\"values_acgt\":[0.25,0.25,0.25,0.25]},\
+\"motifs\":{\"exact_pwm_reuse\":true,\"mapped_motif_ids\":2,\"pwm_groups\":2},\
+\"promoters\":{\"count\":2},\"runtime\":{\"seconds\":1.0},\
+\"scan_jobs\":{\"cache_hits\":0,\"cache_misses\":0},\
+\"scan_algorithm\":{\"strands\":\"both\"}}",
+    );
+    let sites = write(
+        "sites.tsv",
+        "motif_ids\tgene_id\tp_value\tscore\nMA0001.1\tG1\t1e-5\t8.0\nMA0001.1;MA0002.1\tG2\t2e-5\t7.0\n",
+    );
+    let testability = write(
+        "testability.tsv",
+        "motif_id\tpwm_hash\tmatrix_length\tinformation_content\tmax_score\tmin_pvalue\trequested_pvalue\tattainable\tstatus\tmapped\tmotif_id_hit_count\ttf_count\tbackground_mode\n\
+MA0001.1\th1\t6\t4.0\t3.0\t1e-6\t1e-4\ttrue\tsignificant_hits\ttrue\t2\t1\tuniform\n\
+MA0002.1\th2\t6\t4.0\t3.0\t1e-6\t1e-4\ttrue\tsignificant_hits\ttrue\t1\t1\tuniform\n",
+    );
+    let promoters = write(
+        "promoter-summary.tsv",
+        "gene_id\tchrom\tpromoter_start\tpromoter_end\tpromoter_strand\tpromoter_length\tscanned_pwms\ttestable_pwms\tpwms_with_hits\tsites\tbest_pvalue\tbest_score\tbest_pwm_hash\tbest_motif_ids\n\
+G1\tChr1\t1\t1000\t+\t1000\t2\t2\t1\t1\t1e-5\t8.0\th1\tMA0001.1\n\
+G2\tChr1\t2001\t3000\t+\t1000\t2\t2\t2\t2\t2e-5\t7.0\th2\tMA0001.1;MA0002.1\n",
+    );
+    let policy_rows_text = "policy\tpolicy_version\ttf_id\tmotif_id\tselection_role\tselection_source\tselection_group\tspecificity_group\treference_tf_id\tselection_order\n\
+all\tphase5-v1\tTF1\tMA0001.1\tfixed\tbase_map\tHSF|whole_protein|1|10-100\tHSF_T080_001\tD1\t0\n\
+all\tphase5-v1\tTF1\tMA0002.1\texploratory\tcoordinate_rerun\tHSF|full_architecture|1|10-100\tHSF_T080_002\tD2\t1\n\
+best\tphase5-v1\tTF1\tMA0001.1\tfixed\tbase_map\tHSF|whole_protein|1|10-100\tHSF_T080_001\tD1\t0\n\
+reps\tphase5-v1\tTF1\tMA0001.1\tfixed\tbase_map\tHSF|whole_protein|1|10-100\tHSF_T080_001\tD1\t0\n";
+    let policy_rows = write("policy-rows.tsv", policy_rows_text);
+    let policy_config = write(
+        "policy-config.tsv",
+        "policy\tpolicy_version\tparameters_json\tsource_file\tsource_sha256\tcoordinate_source\tcoordinate_sha256\trow_count\n\
+all\tphase5-v1\t{}\ttf_map.tsv\tabc\ttf_map.tsv\tabc\t2\n\
+best\tphase5-v1\t{}\ttf_map.tsv\tabc\ttf_map.tsv\tabc\t1\n\
+reps\tphase5-v1\t{}\ttf_map.tsv\tabc\ttf_map.tsv\tabc\t1\n",
+    );
+    let out = dir.join("background.db");
+
+    let build = |policy_rows: &PathBuf, out: &PathBuf| {
+        Command::new(env!("CARGO_BIN_EXE_regutrace"))
+            .args([
+                "background",
+                "--tf-genes", tf_genes.to_str().unwrap(),
+                "--tf-map", tf_map.to_str().unwrap(),
+                "--sites", sites.to_str().unwrap(),
+                "--testability", testability.to_str().unwrap(),
+                "--promoter-summary", promoters.to_str().unwrap(),
+                "--scan-manifest", manifest.to_str().unwrap(),
+                "--motifs", motifs.to_str().unwrap(),
+                "--policy-rows", policy_rows.to_str().unwrap(),
+                "--policy-config", policy_config.to_str().unwrap(),
+                "--policy-version", "phase5-v1",
+                "--promoter-upstream", "1000",
+                "--promoter-downstream", "0",
+                "--pvalue", "1e-4",
+                "--mapping-mode", "exploratory",
+                "--out", out.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap()
+    };
+
+    let output = build(&policy_rows, &out);
+    assert!(
+        output.status.success(),
+        "background build failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let conn = Connection::open_with_flags(
+        &out,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let user_version: i64 = conn
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(user_version, 3);
+    let meta = |key: &str| -> String {
+        conn.query_row("SELECT value FROM meta WHERE key=?1", [key], |row| row.get(0))
+            .unwrap_or_default()
+    };
+    assert_eq!(meta("pvalue"), "0.0001");
+    assert_eq!(meta("promoter_upstream_bp"), "1000");
+    assert_eq!(meta("promoter_downstream_bp"), "0");
+    assert_eq!(meta("source_mode"), "site_only_exploratory");
+    assert_eq!(meta("mapping_mode"), "exploratory");
+    assert!(!meta("coordinate_system").is_empty());
+    assert!(!meta("normalized_layers").is_empty());
+    assert_eq!(meta("policy_version"), "phase5-v1");
+
+    let library: String = conn
+        .query_row("SELECT value FROM scan_config WHERE key='motif_library'", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(library, "JASPAR2024_CORE_plants.txt");
+    assert!(!library.contains('/') && !library.contains('\\'));
+
+    // The canonical invariants still hold on the synthetic build.
+    let selected: i64 = conn
+        .query_row("SELECT COUNT(*) FROM tf_motif_selected", [], |row| row.get(0))
+        .unwrap();
+    let best_policy: i64 = conn
+        .query_row("SELECT COUNT(*) FROM tf_motif_policy WHERE policy='best'", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(selected, best_policy);
+    let pairs: i64 = conn.query_row("SELECT COUNT(*) FROM pairs", [], |row| row.get(0)).unwrap();
+    assert_eq!(pairs, 2, "best policy selects MA0001.1 over targets G1 and G2");
+    drop(conn);
+
+    // The v3 contract is what the dashboard gates every export on.
+    let ok_check = Command::new(env!("CARGO_BIN_EXE_regutrace"))
+        .args(["validate-db", "--db", out.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        ok_check.status.success(),
+        "validate-db rejected a freshly built v3 database: {}",
+        String::from_utf8_lossy(&ok_check.stderr)
+    );
+    assert!(String::from_utf8_lossy(&ok_check.stdout).contains("schema-v3"));
+
+    // Removing a mapped motif must be reported as a dangling policy reference,
+    // not silently accepted.
+    let broken_db = dir.join("broken.db");
+    std::fs::copy(&out, &broken_db).unwrap();
+    {
+        let conn = Connection::open(&broken_db).unwrap();
+        conn.execute("DELETE FROM tf_motif WHERE motif_id = 'MA0002.1'", []).unwrap();
+    }
+    let bad_check = Command::new(env!("CARGO_BIN_EXE_regutrace"))
+        .args(["validate-db", "--db", broken_db.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(!bad_check.status.success(), "validate-db accepted a database with dangling policy rows");
+    let stderr = String::from_utf8_lossy(&bad_check.stderr);
+    assert!(
+        stderr.contains("missing from tf_motif"),
+        "unexpected validate-db error: {stderr}"
+    );
+
+    // Legacy prior databases carry no meta table and must keep the old
+    // hits/pairs validation instead of failing on a missing schema marker.
+    let legacy = dir.join("legacy-prior.db");
+    {
+        let conn = Connection::open(&legacy).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE hits (tf_id TEXT NOT NULL, tf_symbol TEXT NOT NULL DEFAULT '',
+               target_id TEXT NOT NULL, target_symbol TEXT NOT NULL DEFAULT '',
+               evidence_type TEXT NOT NULL DEFAULT '', evidence_level TEXT NOT NULL DEFAULT '',
+               method TEXT NOT NULL DEFAULT '', source TEXT NOT NULL DEFAULT '',
+               pmid TEXT NOT NULL DEFAULT '', condition TEXT NOT NULL DEFAULT '',
+               promoter_start INTEGER, promoter_end INTEGER, motif_id TEXT NOT NULL DEFAULT '',
+               hit_start INTEGER, hit_end INTEGER, strand TEXT NOT NULL DEFAULT '',
+               score REAL, p_value REAL, notes TEXT NOT NULL DEFAULT '');
+             CREATE TABLE pairs (tf_id TEXT NOT NULL, tf_symbol TEXT NOT NULL,
+               target_id TEXT NOT NULL, target_symbol TEXT NOT NULL, n_sites INTEGER NOT NULL,
+               n_motifs INTEGER NOT NULL, best_p REAL, best_score REAL, motifs TEXT,
+               evidence_levels TEXT);
+             CREATE INDEX pairs_tf ON pairs(tf_id);
+             CREATE INDEX pairs_target ON pairs(target_id);
+             CREATE INDEX hits_tf ON hits(tf_id);
+             CREATE INDEX hits_target ON hits(target_id);
+             CREATE INDEX hits_motif ON hits(motif_id);
+             CREATE INDEX hits_p ON hits(p_value);",
+        )
+        .unwrap();
+    }
+    let legacy_check = Command::new(env!("CARGO_BIN_EXE_regutrace"))
+        .args(["validate-db", "--db", legacy.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        legacy_check.status.success(),
+        "validate-db rejected a legacy prior database: {}",
+        String::from_utf8_lossy(&legacy_check.stderr)
+    );
+    assert!(String::from_utf8_lossy(&legacy_check.stdout).contains("valid TF-target prior"));
+
+    // A build that fails after the temp database is created must not leave it
+    // (or its WAL sidecars) behind.
+    let broken = write("policy-rows-broken.tsv", "policy\ttf_id\nall\tTF1\n");
+    let failed = build(&broken, &dir.join("should-not-exist.db"));
+    assert!(!failed.status.success());
+    assert!(
+        !dir.join("should-not-exist.db").exists(),
+        "a failed build must not publish a database"
+    );
+    let leftovers: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.contains(".regutrace-") && name.contains(".tmp"))
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "failed background build left temp files behind: {leftovers:?}"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }

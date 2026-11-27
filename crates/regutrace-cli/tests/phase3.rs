@@ -116,7 +116,12 @@ TF2\tTF2\tTEST\tMA0001.2\n",
         )
     };
 
-    let (out, sites, testability, summary, manifest, stderr) = run("first", &[]);
+    // The block below re-baselines the legacy uniform scan: its site rows,
+    // evidence counts and cache-key expectations were all measured under that
+    // null, so it is pinned explicitly now that the default is the fitted
+    // promoter composition.
+    let (out, sites, testability, summary, manifest, stderr) =
+        run("first", &["--background-mode", "uniform"]);
     let evidence = std::fs::read_to_string(&out).unwrap();
     assert_eq!(evidence.lines().count().saturating_sub(1), 2, "{stderr}");
     let site_text = std::fs::read_to_string(&sites).unwrap();
@@ -143,20 +148,26 @@ TF2\tTF2\tTEST\tMA0001.2\n",
     assert_eq!(manifest_json["scan_jobs"]["cache_hits"], 0);
 
     // The same cache and inputs must be a pure cache hit.
-    let (_, _, _, _, second_manifest, _) = run("second", &[]);
+    let (_, _, _, _, second_manifest, _) =
+        run("second", &["--background-mode", "uniform"]);
     let second: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&second_manifest).unwrap()).unwrap();
     assert_eq!(second["scan_jobs"]["cache_hits"], 1);
     assert_eq!(second["scan_jobs"]["cache_misses"], 0);
 
     // Changing the requested p-value must change the cache key.
-    let (_, _, _, _, changed_manifest, _) = run("changed", &["--pvalue", "1e-2"]);
+    let (_, _, _, _, changed_manifest, _) = run(
+        "changed",
+        &["--background-mode", "uniform", "--pvalue", "1e-2"],
+    );
     let changed: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&changed_manifest).unwrap()).unwrap();
     assert_eq!(changed["scan_jobs"]["cache_hits"], 0);
     assert_eq!(changed["scan_jobs"]["cache_misses"], 1);
 
-    // Empirical background is a different scan model and a different key.
+    // The default null is the fitted promoter composition. Naming it explicitly
+    // differs from the pinned uniform runs above, and the manifest must record
+    // which null produced the p-values.
     let (_, _, _, _, empirical_manifest, _) = run(
         "empirical",
         &["--background-mode", "empirical", "--pvalue", "1e-3"],
@@ -169,6 +180,11 @@ TF2\tTF2\tTEST\tMA0001.2\n",
         .as_str()
         .unwrap()
         .starts_with("empirical"));
+    assert_eq!(empirical["null_model"]["calibrated"], true);
+    assert_eq!(
+        empirical["background"]["calibrated_to_promoter_composition"],
+        true
+    );
     let bg: Vec<f64> = empirical["background"]["values_acgt"]
         .as_array()
         .unwrap()
@@ -178,6 +194,18 @@ TF2\tTF2\tTEST\tMA0001.2\n",
     assert!((bg.iter().sum::<f64>() - 1.0).abs() < 1e-12);
     assert_eq!(bg[0], bg[3]);
     assert_eq!(bg[1], bg[2]);
+
+    // Omitting the mode must land on the same cache entry as naming empirical:
+    // the default is that model, not a third one.
+    let (_, _, _, _, default_manifest, _) = run("default-null", &["--pvalue", "1e-3"]);
+    let default_null: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&default_manifest).unwrap()).unwrap();
+    assert!(default_null["background"]["mode"]
+        .as_str()
+        .unwrap()
+        .starts_with("empirical"));
+    assert_eq!(default_null["scan_jobs"]["cache_hits"], 1);
+    assert_eq!(default_null["scan_jobs"]["cache_misses"], 0);
 
     // A 2-bp motif cannot reach p <= 1e-8 and must be reported, not silently
     // treated as a motif with zero biological signal.

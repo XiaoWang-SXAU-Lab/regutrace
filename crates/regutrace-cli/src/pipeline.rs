@@ -12,6 +12,15 @@ const REQUIRED_FILES: [&str; 6] = [
     "motifs",
 ];
 
+const OPTIONAL_MAPPING_FILES: [&str; 6] = [
+    "donor_dbd",
+    "donor_dbd_faa",
+    "exploratory_thresholds",
+    "calibrated_dbd_models",
+    "calibrated_thresholds",
+    "specificity_groups",
+];
+
 #[derive(Debug, serde::Deserialize)]
 struct Manifest {
     pack_version: String,
@@ -127,6 +136,26 @@ fn load_pack(dir: &Path) -> Result<ReferencePack> {
             .files
             .get(key)
             .with_context(|| format!("reference pack manifest is missing files.{key}"))?;
+        let expected = manifest
+            .checksums
+            .get(relative)
+            .with_context(|| format!("reference pack manifest is missing a checksum for {relative}"))?
+            .trim()
+            .trim_start_matches('*')
+            .to_ascii_lowercase();
+        let path = resolve_pack_path(dir, relative, key)?;
+        let actual = sha256_file(&path)?;
+        if actual != expected {
+            bail!(
+                "reference pack checksum mismatch for {relative}: expected {expected}, got {actual}"
+            );
+        }
+        paths.insert(key.to_owned(), path);
+    }
+    for key in OPTIONAL_MAPPING_FILES {
+        let Some(relative) = manifest.files.get(key) else {
+            continue;
+        };
         let expected = manifest
             .checksums
             .get(relative)
@@ -285,15 +314,154 @@ fn output_paths(out_dir: &Path) -> BTreeMap<&'static str, PathBuf> {
     .collect()
 }
 
+
+// Stage boundaries report actual work; elapsed-time percentages are not estimated.
+fn report_pipeline_stage(path: &Path, stage: &str, message: &str) -> Result<()> {
+    let progress = serde_json::json!({"stage": stage, "progress": 0.0, "message": message});
+    fs::write(path, serde_json::to_vec(&progress)?).context("write pipeline stage")
+}
+
+fn optional_pack_path<'a>(pack: &'a ReferencePack, key: &str) -> Result<&'a Path> {
+    let path = pack.path(key);
+    if path.as_os_str().is_empty() {
+        bail!(
+            "reference pack {} does not provide {key}; extended mapping is unavailable for this pack",
+            pack.manifest.pack_version
+        );
+    }
+    Ok(path)
+}
+
+fn run_dbd_mapping(
+    pack: &ReferencePack,
+    genes: &Path,
+    sequence: &Path,
+    is_cds: bool,
+    blastp: &Path,
+    models: &Path,
+    threshold: &Path,
+    out: &Path,
+    allow_uncalibrated: bool,
+    reciprocal_required: bool,
+) -> Result<()> {
+    let donor = optional_pack_path(pack, "donor_dbd")?;
+    let donor_faa = optional_pack_path(pack, "donor_dbd_faa")?;
+    let mut args = vec![
+        "--tf-genes".to_owned(),
+        genes.to_string_lossy().into_owned(),
+        "--dbd-models".to_owned(),
+        models.to_string_lossy().into_owned(),
+        "--reference-map".to_owned(),
+        pack.path("reference_map").to_string_lossy().into_owned(),
+        "--donor-dbd".to_owned(),
+        donor.to_string_lossy().into_owned(),
+        "--donor-dbd-faa".to_owned(),
+        donor_faa.to_string_lossy().into_owned(),
+        "--threshold-config".to_owned(),
+        threshold.to_string_lossy().into_owned(),
+        "--blastp".to_owned(),
+        blastp.to_string_lossy().into_owned(),
+        "--reference-pack-version".to_owned(),
+        pack.manifest.pack_version.clone(),
+        "--out".to_owned(),
+        out.to_string_lossy().into_owned(),
+    ];
+    if is_cds {
+        args.extend(["--cds".to_owned(), sequence.to_string_lossy().into_owned()]);
+    } else {
+        args.extend(["--proteins".to_owned(), sequence.to_string_lossy().into_owned()]);
+    }
+    if let Some(specificity) = pack.paths.get("specificity_groups") {
+        args.extend([
+            "--specificity-groups".to_owned(),
+            specificity.to_string_lossy().into_owned(),
+        ]);
+    }
+    if allow_uncalibrated {
+        args.extend(["--allow-uncalibrated".to_owned(), "true".to_owned()]);
+    }
+    if reciprocal_required {
+        args.extend(["--require-reciprocal-dbd".to_owned(), "true".to_owned()]);
+    }
+    motif_transfer::run_map_dbd_motifs(&args).context("DBD motif mapping failed")
+}
+
+fn merge_tf_maps(strict: &Path, extra: &[PathBuf], out: &Path) -> Result<usize> {
+    let mut headers: Vec<String> = Vec::new();
+    let mut records: Vec<(String, BTreeMap<String, String>)> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for (layer_index, path) in std::iter::once(strict)
+        .chain(extra.iter().map(PathBuf::as_path))
+        .enumerate()
+    {
+        if !path.exists() {
+            continue;
+        }
+        let mut reader = ReaderBuilder::new()
+            .delimiter(b'\t')
+            .flexible(true)
+            .from_path(path)
+            .with_context(|| format!("open {}", path.display()))?;
+        let file_headers = reader.headers()?.clone();
+        for header in file_headers.iter() {
+            if !headers.iter().any(|item| item == header) {
+                headers.push(header.to_owned());
+            }
+        }
+        for record in reader.records() {
+            let record = record?;
+            let mut row = BTreeMap::new();
+            for (index, header) in file_headers.iter().enumerate() {
+                row.insert(header.to_owned(), record.get(index).unwrap_or("").to_owned());
+            }
+            if layer_index == 0
+                && row
+                    .get("mapping_status")
+                    .is_none_or(|value| value.trim().is_empty())
+            {
+                row.insert("mapping_status".to_owned(), "strict_rbh".to_owned());
+            }
+            let key = format!(
+                "{}|{}|{}",
+                row.get("tf_id").cloned().unwrap_or_default(),
+                row.get("motif_id").cloned().unwrap_or_default(),
+                row.get("reference_tf_id").cloned().unwrap_or_default()
+            );
+            if seen.insert(key.clone()) {
+                records.push((key, row));
+            }
+        }
+    }
+    if headers.is_empty() {
+        bail!("TF–motif mapping produced no header");
+    }
+    let tmp = temp_output_path(out);
+    {
+        let mut writer = WriterBuilder::new()
+            .delimiter(b'\t')
+            .from_path(&tmp)
+            .with_context(|| format!("write {}", tmp.display()))?;
+        writer.write_record(&headers)?;
+        for (_, row) in &records {
+            writer.write_record(headers.iter().map(|header| {
+                row.get(header).map(String::as_str).unwrap_or("")
+            }))?;
+        }
+        writer.flush()?;
+    }
+    publish_temp(&tmp, out)?;
+    Ok(records.len())
+}
+
+const PIPELINE_FLAGS: &[&str] = &[
+    "--include-single-domain-fallback",
+    "--reuse-exact-pwm",
+    "--phase3-artifacts",
+    "--sites-only",
+];
+
 pub(super) fn run(args: &[String]) -> Result<()> {
-    let opts = parse_options_with_flags(
-        args,
-        &[
-            "--include-single-domain-fallback",
-            "--reuse-exact-pwm",
-            "--phase3-artifacts",
-        ],
-    )?;
+    let opts = parse_options_with_flags(args, PIPELINE_FLAGS)?;
     for key in opts.keys() {
         if !matches!(
             key.as_str(),
@@ -317,6 +485,8 @@ pub(super) fn run(args: &[String]) -> Result<()> {
                 | "--threads"
                 | "--hmmsearch"
                 | "--blastp"
+                | "--mapping-mode"
+                | "--sites-only"
         ) {
             bail!("unknown option: {key}");
         }
@@ -336,6 +506,13 @@ pub(super) fn run(args: &[String]) -> Result<()> {
         _ => bail!("supply exactly one of --proteins or --cds"),
     };
     let include_fallback = bool_option(&opts, "--include-single-domain-fallback");
+    let mapping_mode = opts
+        .get("--mapping-mode")
+        .cloned()
+        .unwrap_or_else(|| "strict".to_string());
+    if !matches!(mapping_mode.as_str(), "strict" | "balanced" | "exploratory") {
+        bail!("--mapping-mode must be strict, balanced or exploratory");
+    }
     let pack = load_pack(&pack_dir)?;
     let promoter_len = opts
         .get("--promoter-len")
@@ -360,10 +537,18 @@ pub(super) fn run(args: &[String]) -> Result<()> {
         .map(|value| super::parse_background(value))
         .transpose()?
         .unwrap_or([0.25; 4]);
-    let background_mode = opts
-        .get("--background-mode")
-        .cloned()
-        .unwrap_or_else(|| "uniform".to_string());
+    // The promoter A/C/G/T composition is the correct null: a uniform i.i.d.
+    // background mis-calibrates every p-value on species whose promoters are
+    // A/T-rich (measured at r=0.24 against observed per-motif coverage on HF1,
+    // versus r=0.94 for the composition-matched null). `uniform` stays available
+    // for comparability with results produced before this default changed.
+    let background_mode = match opts.get("--background-mode") {
+        Some(mode) => mode.clone(),
+        // An explicit --background supplies the whole null, so it keeps the
+        // uniform model it has always described.
+        None if opts.contains_key("--background") => "uniform".to_string(),
+        None => "empirical".to_string(),
+    };
     if !matches!(background_mode.as_str(), "uniform" | "empirical") {
         bail!("--background-mode must be uniform or empirical");
     }
@@ -372,6 +557,10 @@ pub(super) fn run(args: &[String]) -> Result<()> {
     }
     let reuse_exact_pwm = bool_option(&opts, "--reuse-exact-pwm");
     let phase3_artifacts = bool_option(&opts, "--phase3-artifacts");
+    let sites_only = bool_option(&opts, "--sites-only");
+    if sites_only && !phase3_artifacts {
+        bail!("--sites-only requires --phase3-artifacts");
+    }
     let gene_biotype = opts
         .get("--gene-biotype")
         .cloned()
@@ -421,6 +610,7 @@ pub(super) fn run(args: &[String]) -> Result<()> {
         pack.manifest.assembly
     );
 
+    report_pipeline_stage(&outputs["progress"], "identifying_tfs", "Identifying transcription factors")?;
     // 1. TF catalogue from protein/CDS + GFF; no user gene-map.
     let mut args = vec![
         "--gff".to_owned(),
@@ -449,7 +639,9 @@ pub(super) fn run(args: &[String]) -> Result<()> {
     let genes = io::read_tf_genes_allow_empty(&outputs["tf_genes"])
         .with_context(|| format!("read {}", outputs["tf_genes"].display()))?;
 
+    report_pipeline_stage(&outputs["progress"], "mapping_motifs", "Finding reference motif assignments")?;
     // 2. TF -> motif mapping from the same protein/CDS FASTA.
+    let strict_map = out_dir.join("tf_map.strict.tsv");
     let mut args = vec![
         "--tf-genes".to_owned(),
         outputs["tf_genes"].to_string_lossy().into_owned(),
@@ -458,7 +650,7 @@ pub(super) fn run(args: &[String]) -> Result<()> {
         "--blastp".to_owned(),
         blastp.to_string_lossy().into_owned(),
         "--out".to_owned(),
-        outputs["tf_map"].to_string_lossy().into_owned(),
+        strict_map.to_string_lossy().into_owned(),
         "--diagnostics-out".to_owned(),
         outputs["mapping_diagnostics"].to_string_lossy().into_owned(),
         "--diagnostics-family-out".to_owned(),
@@ -481,6 +673,52 @@ pub(super) fn run(args: &[String]) -> Result<()> {
         ]);
     }
     motif_transfer::run(&args).context("TF–motif mapping failed")?;
+    if mapping_mode == "strict" {
+        fs::rename(&strict_map, &outputs["tf_map"]).with_context(|| {
+            format!(
+                "move strict TF–motif mapping {} to {}",
+                strict_map.display(),
+                outputs["tf_map"].display()
+            )
+        })?;
+    } else {
+        report_pipeline_stage(&outputs["progress"], "mapping_dbd", "Evaluating domain-supported motif candidates")?;
+        let calibrated_models = optional_pack_path(&pack, "calibrated_dbd_models")?;
+        let calibrated_thresholds = optional_pack_path(&pack, "calibrated_thresholds")?;
+        optional_pack_path(&pack, "specificity_groups")?;
+        let calibrated_map = out_dir.join("tf_map.calibrated.tsv");
+        run_dbd_mapping(
+            &pack,
+            &outputs["tf_genes"],
+            &sequence,
+            is_cds,
+            &blastp,
+            calibrated_models,
+            calibrated_thresholds,
+            &calibrated_map,
+            false,
+            true,
+        )?;
+        let mut extras = vec![calibrated_map];
+        if mapping_mode == "exploratory" {
+            let exploratory_thresholds = optional_pack_path(&pack, "exploratory_thresholds")?;
+            let exploratory_map = out_dir.join("tf_map.exploratory.tsv");
+            run_dbd_mapping(
+                &pack,
+                &outputs["tf_genes"],
+                &sequence,
+                is_cds,
+                &blastp,
+                pack.path("dbd_models"),
+                exploratory_thresholds,
+                &exploratory_map,
+                true,
+                false,
+            )?;
+            extras.push(exploratory_map);
+        }
+        merge_tf_maps(&strict_map, &extras, &outputs["tf_map"])?;
+    }
     let tf_map = io::read_tf_map_allow_empty(&outputs["tf_map"]).with_context(|| {
         format!(
             "read {}; the pack produced no usable TF–motif mappings",
@@ -574,6 +812,9 @@ pub(super) fn run(args: &[String]) -> Result<()> {
     if include_fallback {
         args.push("--include-single-domain-fallback".to_owned());
     }
+    if sites_only {
+        args.push("--sites-only".to_owned());
+    }
     if let Some(downstream) = opts.get("--downstream") {
         args.extend(["--downstream".to_owned(), downstream.clone()]);
     }
@@ -626,15 +867,19 @@ pub(super) fn run(args: &[String]) -> Result<()> {
         gene_biotype_status(&gene_biotype, gene_biotype_from_pack, &scan_report);
 
     // 4. SQLite evidence database in the hits/pairs schema used by prior.
-    let args = vec![
-        "--input".to_owned(),
-        outputs["evidence"].to_string_lossy().into_owned(),
-        "--out".to_owned(),
-        outputs["database"].to_string_lossy().into_owned(),
-        "--format".to_owned(),
-        "sqlite".to_owned(),
-    ];
-    cmd_convert(&args).context("SQLite conversion failed")?;
+    // Site-only jobs intentionally keep evidence empty and use the site table;
+    // the schema-v3 background export is built from sites + policy mappings.
+    if !sites_only {
+        let args = vec![
+            "--input".to_owned(),
+            outputs["evidence"].to_string_lossy().into_owned(),
+            "--out".to_owned(),
+            outputs["database"].to_string_lossy().into_owned(),
+            "--format".to_owned(),
+            "sqlite".to_owned(),
+        ];
+        cmd_convert(&args).context("SQLite conversion failed")?;
+    }
 
     let edges = io::read_edges(&outputs["evidence"])
         .with_context(|| format!("read {}", outputs["evidence"].display()))?;
@@ -1174,5 +1419,51 @@ mod tests {
         let status = gene_biotype_status(&None, false, &none);
         assert_eq!(status["status"], "not_requested");
         assert_eq!(status["source"], "none");
+    }
+
+    #[test]
+    fn pipeline_boolean_flags_do_not_consume_following_options() {
+        let args = vec![
+            "--phase3-artifacts".to_owned(),
+            "--sites-only".to_owned(),
+            "--reuse-exact-pwm".to_owned(),
+            "--promoter-len".to_owned(),
+            "1000".to_owned(),
+        ];
+        let opts = parse_options_with_flags(&args, PIPELINE_FLAGS).unwrap();
+        assert_eq!(opts.get("--sites-only").map(String::as_str), Some("true"));
+        assert_eq!(
+            opts.get("--reuse-exact-pwm").map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(opts.get("--promoter-len").map(String::as_str), Some("1000"));
+        assert!(bool_option(&opts, "--sites-only"));
+        assert!(bool_option(&opts, "--reuse-exact-pwm"));
+    }
+
+    #[test]
+    fn merged_strict_map_gets_explicit_mapping_status() {
+        let dir = temp_dir("merge-status");
+        let strict = dir.join("strict.tsv");
+        let calibrated = dir.join("calibrated.tsv");
+        let out = dir.join("merged.tsv");
+        std::fs::write(
+            &strict,
+            "tf_id\ttf_symbol\tfamily\tmotif_id\treference_tf_id\tmapping_method\tdomain_mode\tdomain_count\n\
+             TF1\tTF1\tNAC\tMA0001.1\tD1\treciprocal_protein_similarity\twhole_protein\t0\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &calibrated,
+            "tf_id\ttf_symbol\tfamily\tmotif_id\treference_tf_id\tmapping_method\tdomain_mode\tdomain_count\tmapping_status\n\
+             TF2\tTF2\tNAC\tMA0002.1\tD2\tdbd_transfer_calibrated\tfull_architecture\t1\tdbd_calibrated\n",
+        )
+        .unwrap();
+        let rows = merge_tf_maps(&strict, &[calibrated], &out).unwrap();
+        assert_eq!(rows, 2);
+        let text = std::fs::read_to_string(&out).unwrap();
+        assert!(text.contains("\tstrict_rbh"), "{text}");
+        assert!(text.contains("dbd_calibrated"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -25,6 +25,7 @@ use rusqlite::types::Value;
 use rusqlite::{params_from_iter, params, Connection, OpenFlags};
 use serde_json::Value as JsonValue;
 
+mod background;
 mod enrich;
 mod motif_transfer;
 mod pipeline;
@@ -53,6 +54,7 @@ struct Args {
     background: [f64; 4],
     background_mode: String,
     background_explicit: bool,
+    background_mode_explicit: bool,
     both_strands: bool,
     max_genes: Option<usize>,
     gene_biotype: Option<String>,
@@ -103,8 +105,9 @@ impl Default for Args {
             pvalue: 1e-4,
             min_score: None,
             background: [0.25; 4],
-            background_mode: "uniform".to_string(),
+            background_mode: "empirical".to_string(),
             background_explicit: false,
+            background_mode_explicit: false,
             both_strands: true,
             max_genes: None,
             gene_biotype: None,
@@ -133,7 +136,13 @@ USAGE:\n\
   regutrace scan --genome <fa[.gz]> --gff <gff3[.gz]> --motifs <jaspar.txt> \\\n\
     [--tf-map <tf_map.tsv>] [--tf-genes <tf_genes.tsv>] --out <edges.tsv> [options]\n\
   regutrace pipeline --reference-pack <dir> --genome <fa> --gff <gff3> \\\n\
-    (--proteins <faa> | --cds <fna>) --out-dir <dir> [options]\n\
+    (--proteins <faa> | --cds <fna>) --out-dir <dir> [--mapping-mode strict|balanced|exploratory] [options]\n\
+  regutrace background --tf-genes <tsv> --tf-map <tsv> --sites <tsv> --testability <tsv> \\\n\
+    --promoter-summary <tsv> --scan-manifest <json> --motifs <jaspar> \\\n\
+    --policy-rows <tsv> --policy-config <tsv> --out <background.db> \\\n\
+    [--policy-version <id>] [--motif-metadata <tsv>] [--promoter-upstream <bp>] \\\n\
+    [--promoter-downstream <bp>] [--pvalue <p>] [--mapping-mode strict|balanced|exploratory]\n\
+    [--site-count independent|overlapping (default independent)]\n\
   regutrace trace --tf-genes <tsv> --tf-map <tsv> --evidence <tsv> --motifs <jaspar> \\\n\
     [--reference-map <tsv>] [--pack-version <label>] [--include-single-domain-fallback] --out-dir <dir>\n\
   regutrace import --db <evidence.db> --evidence <edges.tsv>\n\
@@ -194,8 +203,9 @@ IDENTIFY-TFS OPTIONS:\n\
   --promoters-out <fa>    export extracted promoters as FASTA\n\
   --pvalue <p>            PWM hit p-value cutoff (default 1e-4)\n\
   --min-score <s>         minimum PWM score (log2 odds; for benchmarks)\n\
-  --background <A,C,G,T>  base probabilities (default 0.25,0.25,0.25,0.25)\n\
-  --background-mode <m>   uniform (default) or empirical promoter A/C/G/T model\n\
+  --background <A,C,G,T>  base probabilities for --background-mode uniform\n\
+  --background-mode <m>   empirical (default) or uniform; empirical fits a\n\
+                          strand-symmetric zero-order null to the promoters\n\
   --reuse-exact-pwm       scan one representative per bit-identical PWM matrix\n\
   --scan-cache <dir>      persistent per-PWM scan cache keyed by all scan inputs\n\
   --sites-out <tsv>       write one row per unique PWM site (not per TF)\n\
@@ -318,6 +328,7 @@ fn parse_scan_args(args: &[String]) -> Result<Args> {
                     bail!("--background-mode must be uniform or empirical, got {value}");
                 }
                 a.background_mode = value.to_string();
+                a.background_mode_explicit = true;
             }
             "--reuse-exact-pwm" => a.reuse_exact_pwm = true,
             "--scan-cache" => {
@@ -407,6 +418,12 @@ fn parse_scan_args(args: &[String]) -> Result<Args> {
     }
     if a.sites_only && a.sites_out.is_none() {
         bail!("--sites-only requires --sites-out");
+    }
+    // An explicit --background supplies the whole null, so it implies the
+    // uniform model even though empirical is now the default. Silently ignoring
+    // four user-supplied frequencies would be worse than the old default.
+    if a.background_explicit && !a.background_mode_explicit {
+        a.background_mode = "uniform".to_string();
     }
     if a.background_mode == "empirical" && a.background_explicit {
         bail!("--background and --background-mode empirical are mutually exclusive");
@@ -1093,6 +1110,27 @@ fn run_validate(
     Ok(())
 }
 
+/// A uniform null is still allowed, but it is no longer the calibrated default,
+/// so it must not pass silently. Only `scan` computes p-values, so only `scan`
+/// calls this; `validate` shares the option parser but never scores anything.
+fn warn_uncalibrated_null(a: &Args) {
+    if a.background_mode != "uniform" {
+        return;
+    }
+    // Naming 0.25-per-base unconditionally was wrong: `--background` implies
+    // uniform while supplying four arbitrary frequencies.
+    let null = if a.background.iter().all(|v| (v - 0.25).abs() < 1e-12) {
+        "the default 0.25-per-base i.i.d. null"
+    } else {
+        "the supplied i.i.d. null"
+    };
+    eprintln!(
+        "warning: --background-mode uniform scores against {null}, not against the promoter \
+         base composition, so p-values are not calibrated to the species composition. \
+         The empirical default fits the scanned promoters."
+    );
+}
+
 fn cmd_scan(raw: &[String]) -> Result<()> {
     let report_path = report_path_from_args(raw);
     let progress_path = progress_path_from_args(raw);
@@ -1111,6 +1149,7 @@ fn cmd_scan(raw: &[String]) -> Result<()> {
             return Err(e);
         }
     };
+    warn_uncalibrated_null(&args);
     let mut progress = ProgressWriter::new(args.progress_json.clone());
     progress.write("starting", "running", 0, 1, "starting scan", true);
     let mut report = diagnostics::Report::new("scan");
@@ -1989,9 +2028,422 @@ fn cmd_validate_db(args: &[String]) -> Result<()> {
     if bad_pairs != 0 {
         bail!("database pairs table has {bad_pairs} row(s) with invalid column types");
     }
-    println!("valid TF-target prior database");
+    // A schema-v3 regulatory background is a redistribution artifact, so it is
+    // checked against the full contract rather than just the hits/pairs shape.
+    // Legacy prior databases carry no meta.schema_version and keep the old
+    // behaviour.
+    match meta_value(&conn, "schema_version")?.as_deref() {
+        Some(V3_SCHEMA) => {
+            validate_background_v3(&conn)?;
+            println!("valid schema-v3 regulatory background database");
+        }
+        _ => println!("valid TF-target prior database"),
+    }
     Ok(())
 }
+
+const V3_SCHEMA: &str = "regutrace-regulatory-background-db-v3";
+
+const V3_TABLES: [(&str, &[&str]); 13] = [
+    ("meta", &["key", "value"]),
+    (
+        "tf_catalogue",
+        &["tf_id", "tf_symbol", "family", "identification_status", "source", "motif_count", "target_count"],
+    ),
+    (
+        "tf_motif",
+        &[
+            "tf_id", "tf_symbol", "family", "motif_id", "reference_tf_id", "mapping_method",
+            "domain_mode", "extraction_family", "extraction_models", "domain_count",
+            "mapping_status", "mapping_confidence", "specificity_groups", "dbd_identity",
+            "query_dbd_coverage", "donor_dbd_coverage", "reason_code", "query_full_dbd_start",
+            "query_full_dbd_end", "query_dbd_start", "query_dbd_end", "dbd_bitscore",
+        ],
+    ),
+    ("tf_motif_coordinate", &["tf_id", "motif_id"]),
+    ("tf_motif_selected", &["tf_id", "motif_id"]),
+    (
+        "tf_motif_policy",
+        &[
+            "policy", "policy_version", "tf_id", "motif_id", "selection_role",
+            "selection_source", "selection_group", "specificity_group", "reference_tf_id",
+            "selection_order",
+        ],
+    ),
+    (
+        "tf_motif_policy_config",
+        &[
+            "policy", "policy_version", "parameters_json", "source_file", "source_sha256",
+            "coordinate_source", "coordinate_sha256", "row_count",
+        ],
+    ),
+    ("motif_target", &["motif_id", "target_id", "n_sites", "best_p", "best_score"]),
+    (
+        "motif_registry",
+        &["motif_id", "motif_name", "family", "pwm_hash", "matrix_length", "specificity_group_080", "source"],
+    ),
+    (
+        "motif_testability",
+        &[
+            "motif_id", "pwm_hash", "matrix_length", "information_content", "max_score",
+            "min_pvalue", "requested_pvalue", "attainable", "status", "mapped",
+            "motif_id_hit_count", "tf_count", "background_mode",
+        ],
+    ),
+    (
+        "promoter",
+        &[
+            "gene_id", "chrom", "promoter_start", "promoter_end", "promoter_strand",
+            "promoter_length", "scanned_pwms", "testable_pwms", "pwms_with_hits", "sites",
+            "best_pvalue", "best_score", "best_pwm_hash", "best_motif_ids",
+        ],
+    ),
+    ("scan_config", &["key", "value"]),
+    (
+        "pairs",
+        &[
+            "tf_id", "tf_symbol", "target_id", "target_symbol", "n_sites", "n_motifs",
+            "best_p", "best_score", "motifs", "evidence_levels",
+        ],
+    ),
+];
+
+const V3_INDEXES: [(&str, &str, &[&str]); 17] = [
+    ("pairs", "pairs_tf", &["tf_id"]),
+    ("pairs", "pairs_target", &["target_id"]),
+    ("hits", "hits_tf", &["tf_id"]),
+    ("hits", "hits_target", &["target_id"]),
+    ("hits", "hits_motif", &["motif_id"]),
+    ("hits", "hits_p", &["p_value"]),
+    ("tf_motif_policy", "tmpolicy_tf", &["policy", "tf_id"]),
+    ("tf_motif_policy", "tmpolicy_motif", &["policy", "motif_id"]),
+    ("tf_motif_selected", "tms_motif", &["motif_id"]),
+    ("tf_motif_selected", "tms_tf", &["tf_id"]),
+    ("tf_motif", "tfm_motif", &["motif_id"]),
+    ("tf_motif", "tfm_tf", &["tf_id"]),
+    ("tf_motif_coordinate", "tmc_tf_motif", &["tf_id", "motif_id"]),
+    ("motif_target", "motif_target_motif", &["motif_id"]),
+    ("motif_target", "motif_target_target", &["target_id"]),
+    ("motif_testability", "motif_testability_id", &["motif_id"]),
+    ("promoter", "promoter_gene", &["gene_id"]),
+];
+
+const V3_SCAN_CONFIG_KEYS: [&str; 13] = [
+    "background_mode", "background_values_acgt", "cache_hits", "cache_misses",
+    "exact_pwm_reuse", "mapped_motif_ids", "motif_library", "promoter_count", "pwm_groups",
+    "scan_manifest_path", "scan_seconds", "sites_only", "strands",
+];
+
+/// Envelope keys every schema-v3 background must record. `mapping_mode`,
+/// `coordinate_system` and `policy_sources` are optional because pre-integration
+/// artifacts predate them.
+const V3_META_KEYS: [&str; 13] = [
+    "schema_version", "policy_version", "policy", "evidence_level", "inputs", "counts",
+    "tables", "limitations", "source_mode", "promoter_upstream_bp", "promoter_downstream_bp",
+    "pvalue", "normalized_layers",
+];
+
+fn meta_value(conn: &Connection, key: &str) -> Result<Option<String>> {
+    // Legacy prior databases have no meta table at all; treat that as "no
+    // schema marker" rather than a SQL error.
+    if table_columns(conn, "meta")?.is_none() {
+        return Ok(None);
+    }
+    let mut stmt = conn.prepare("SELECT value FROM meta WHERE key = ?1")?;
+    let mut rows = stmt.query(params![key])?;
+    match rows.next()? {
+        Some(row) => Ok(Some(row.get(0)?)),
+        None => Ok(None),
+    }
+}
+
+fn table_columns(conn: &Connection, table: &str) -> Result<Option<HashSet<String>>> {
+    let exists: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+        params![table],
+        |r| r.get(0),
+    )?;
+    if exists == 0 {
+        return Ok(None);
+    }
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let names: HashSet<String> = stmt
+        .query_map([], |r| r.get::<_, String>(1))?
+        .collect::<std::result::Result<_, _>>()?;
+    Ok(Some(names))
+}
+
+fn require_index(conn: &Connection, table: &str, index: &str, columns: &[&str]) -> Result<()> {
+    let mut indexes = conn.prepare(&format!("PRAGMA index_list({table})"))?;
+    let found = indexes
+        .query_map([], |r| Ok((r.get::<_, String>(1)?, r.get::<_, i64>(4)?)))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let Some((_, partial)) = found.iter().find(|(name, _)| name == index) else {
+        bail!("table {table} is missing index {index}");
+    };
+    if *partial != 0 {
+        bail!("index {index} must not be a partial index");
+    }
+    let mut info = conn.prepare(&format!("PRAGMA index_info({index})"))?;
+    let actual: Vec<String> = info
+        .query_map([], |r| r.get::<_, String>(2))?
+        .collect::<std::result::Result<_, _>>()?;
+    let expected: Vec<&str> = columns.to_vec();
+    if actual.len() != expected.len() || actual.iter().zip(&expected).any(|(a, b)| a != b) {
+        bail!(
+            "index {index} must index {table}({}), found ({})",
+            expected.join(","),
+            actual.join(",")
+        );
+    }
+    Ok(())
+}
+
+fn count_rows(conn: &Connection, sql: &str) -> Result<i64> {
+    Ok(conn.query_row(sql, [], |r| r.get(0))?)
+}
+
+/// Checks the schema-v3 contract: structure, provenance envelope, policy
+/// semantics and the `pairs` == best-policy invariant. Collects every failure
+/// so one run reports all of them.
+fn validate_background_v3(conn: &Connection) -> Result<()> {
+    let mut problems: Vec<String> = Vec::new();
+
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    if version != 3 {
+        problems.push(format!("user_version is {version}, expected 3"));
+    }
+
+    for (table, columns) in V3_TABLES {
+        match table_columns(conn, table)? {
+            None => problems.push(format!("missing table {table}")),
+            Some(names) => {
+                let missing: Vec<&str> =
+                    columns.iter().copied().filter(|c| !names.contains(*c)).collect();
+                if !missing.is_empty() {
+                    problems.push(format!("table {table} is missing columns: {}", missing.join(", ")));
+                }
+            }
+        }
+    }
+    // The legacy block already proved hits/pairs exist with the right columns;
+    // repeated here so a v3 report is self-contained when run on its own.
+    if !problems.is_empty() {
+        return fail(problems);
+    }
+
+    for (table, index, columns) in V3_INDEXES {
+        if let Err(err) = require_index(conn, table, index, columns) {
+            problems.push(format!("{err}"));
+        }
+    }
+
+    if meta_value(conn, "schema_version")?.as_deref() != Some(V3_SCHEMA) {
+        problems.push(format!("meta.schema_version is not {V3_SCHEMA}"));
+    }
+    for key in V3_META_KEYS {
+        if meta_value(conn, key)?.is_none() {
+            problems.push(format!("meta is missing key {key}"));
+        }
+    }
+    if meta_value(conn, "evidence_level")?.as_deref() != Some("D") {
+        problems.push("meta.evidence_level must be D".to_string());
+    }
+    let policy_version = meta_value(conn, "policy_version")?.unwrap_or_default();
+    if policy_version.trim().is_empty() {
+        problems.push("meta.policy_version is empty".to_string());
+    }
+    for key in V3_SCAN_CONFIG_KEYS {
+        let present: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM scan_config WHERE key = ?1",
+            params![key],
+            |r| r.get(0),
+        )?;
+        if present == 0 {
+            problems.push(format!("scan_config is missing key {key}"));
+        }
+    }
+
+    for (label, sql) in [
+        (
+            "rows with an unknown policy label",
+            "SELECT COUNT(*) FROM tf_motif_policy WHERE policy NOT IN ('all','best','reps')",
+        ),
+        (
+            "rows with an unknown selection_role",
+            "SELECT COUNT(*) FROM tf_motif_policy WHERE selection_role NOT IN ('fixed','exploratory','ambiguous')",
+        ),
+        (
+            "rows with an unknown selection_source",
+            "SELECT COUNT(*) FROM tf_motif_policy WHERE selection_source NOT IN ('base_map','coordinate_rerun')",
+        ),
+    ] {
+        let n = count_rows(conn, sql)?;
+        if n != 0 {
+            problems.push(format!("tf_motif_policy has {n} {label}"));
+        }
+    }
+    if !policy_version.trim().is_empty() {
+        let n = count_rows(conn, "SELECT COUNT(*) FROM tf_motif_policy WHERE policy_version <> (SELECT value FROM meta WHERE key='policy_version')")?;
+        if n != 0 {
+            problems.push(format!(
+                "tf_motif_policy has {n} rows whose policy_version differs from meta.policy_version"
+            ));
+        }
+    }
+    let n = count_rows(
+        conn,
+        "SELECT COUNT(*) FROM tf_motif_policy_config c
+         WHERE c.row_count <> (SELECT COUNT(*) FROM tf_motif_policy p WHERE p.policy = c.policy)",
+    )?;
+    if n != 0 {
+        problems.push(format!("{n} tf_motif_policy_config row_count values disagree with tf_motif_policy"));
+    }
+    for (label, sql) in [
+        (
+            "duplicate (tf_id, motif_id) rows in tf_motif_selected",
+            "SELECT COUNT(*) FROM (SELECT tf_id, motif_id FROM tf_motif_selected GROUP BY 1, 2 HAVING COUNT(*) > 1)",
+        ),
+        (
+            "duplicate (policy, tf_id, motif_id) rows in tf_motif_policy",
+            "SELECT COUNT(*) FROM (SELECT policy, tf_id, motif_id FROM tf_motif_policy GROUP BY 1, 2, 3 HAVING COUNT(*) > 1)",
+        ),
+    ] {
+        let n = count_rows(conn, sql)?;
+        if n != 0 {
+            problems.push(format!("{n} {label}"));
+        }
+    }
+
+    for (label, sql) in [
+        (
+            "tf_motif_policy rows whose (tf_id, motif_id) is missing from tf_motif",
+            "SELECT COUNT(*) FROM tf_motif_policy p WHERE NOT EXISTS
+               (SELECT 1 FROM tf_motif m WHERE m.tf_id = p.tf_id AND m.motif_id = p.motif_id)",
+        ),
+        (
+            "tf_motif_policy rows whose motif_id is missing from motif_registry",
+            "SELECT COUNT(*) FROM tf_motif_policy p WHERE NOT EXISTS
+               (SELECT 1 FROM motif_registry r WHERE r.motif_id = p.motif_id)",
+        ),
+        (
+            "tf_motif_policy rows whose tf_id is missing from tf_catalogue",
+            "SELECT COUNT(*) FROM tf_motif_policy p WHERE NOT EXISTS
+               (SELECT 1 FROM tf_catalogue t WHERE t.tf_id = p.tf_id)",
+        ),
+        (
+            "tf_motif_selected rows whose (tf_id, motif_id) is missing from tf_motif",
+            "SELECT COUNT(*) FROM tf_motif_selected s WHERE NOT EXISTS
+               (SELECT 1 FROM tf_motif m WHERE m.tf_id = s.tf_id AND m.motif_id = s.motif_id)",
+        ),
+        (
+            "tf_motif rows whose motif_id is missing from motif_registry",
+            "SELECT COUNT(*) FROM (SELECT DISTINCT motif_id FROM tf_motif) x WHERE NOT EXISTS
+               (SELECT 1 FROM motif_registry r WHERE r.motif_id = x.motif_id)",
+        ),
+        (
+            "motif_target rows whose target_id is missing from promoter",
+            "SELECT COUNT(*) FROM (SELECT DISTINCT target_id FROM motif_target) x WHERE NOT EXISTS
+               (SELECT 1 FROM promoter p WHERE p.gene_id = x.target_id)",
+        ),
+        (
+            "motif_target rows whose motif_id is missing from motif_registry",
+            "SELECT COUNT(*) FROM (SELECT DISTINCT motif_id FROM motif_target) x WHERE NOT EXISTS
+               (SELECT 1 FROM motif_registry r WHERE r.motif_id = x.motif_id)",
+        ),
+    ] {
+        let n = count_rows(conn, sql)?;
+        if n != 0 {
+            problems.push(format!("{n} {label}"));
+        }
+    }
+
+    let n = count_rows(
+        conn,
+        "SELECT COUNT(*) FROM (
+           SELECT tf_id, motif_id FROM tf_motif_selected
+           EXCEPT SELECT tf_id, motif_id FROM tf_motif_policy WHERE policy = 'best')",
+    )? + count_rows(
+        conn,
+        "SELECT COUNT(*) FROM (
+           SELECT tf_id, motif_id FROM tf_motif_policy WHERE policy = 'best'
+           EXCEPT SELECT tf_id, motif_id FROM tf_motif_selected)",
+    )?;
+    if n != 0 {
+        problems.push(format!("tf_motif_selected differs from tf_motif_policy policy='best' in {n} rows"));
+    }
+
+    let n = count_rows(
+        conn,
+        "SELECT COUNT(*) FROM tf_catalogue t
+         WHERE t.target_count <> (SELECT COUNT(*) FROM pairs p WHERE p.tf_id = t.tf_id)",
+    )?;
+    if n != 0 {
+        problems.push(format!("{n} tf_catalogue.target_count values disagree with pairs"));
+    }
+    let n = count_rows(
+        conn,
+        "SELECT COUNT(*) FROM tf_catalogue t
+         WHERE t.motif_count <> (SELECT COUNT(DISTINCT motif_id) FROM tf_motif m WHERE m.tf_id = t.tf_id)",
+    )?;
+    if n != 0 {
+        problems.push(format!("{n} tf_catalogue.motif_count values disagree with tf_motif"));
+    }
+
+    // pairs must be exactly the best-policy reconstruction from motif_target.
+    // Both directions use EXCEPT because `pairs` has no composite
+    // (tf_id, target_id) index: an anti-join driven from the rebuild table
+    // degenerates into a quadratic probe and never finishes on a 1.3 GB file.
+    let duplicate_pairs = count_rows(
+        conn,
+        "SELECT COUNT(*) FROM (SELECT tf_id, target_id FROM pairs GROUP BY 1, 2 HAVING COUNT(*) > 1)",
+    )?;
+    if duplicate_pairs != 0 {
+        problems.push(format!("pairs has {duplicate_pairs} duplicate (tf_id, target_id) keys"));
+    }
+    conn.execute_batch(
+        "CREATE TEMP TABLE v3_rebuild_pairs AS
+         SELECT s.tf_id AS tf_id, mt.target_id AS target_id,
+                SUM(mt.n_sites) AS n_sites, COUNT(DISTINCT mt.motif_id) AS n_motifs
+         FROM tf_motif_selected s JOIN motif_target mt ON mt.motif_id = s.motif_id
+         GROUP BY s.tf_id, mt.target_id",
+    )?;
+    let missing = count_rows(
+        conn,
+        "SELECT COUNT(*) FROM (
+           SELECT tf_id, target_id, n_sites, n_motifs FROM v3_rebuild_pairs
+           EXCEPT SELECT tf_id, target_id, n_sites, n_motifs FROM pairs)",
+    )?;
+    let extra = count_rows(
+        conn,
+        "SELECT COUNT(*) FROM (
+           SELECT tf_id, target_id, n_sites, n_motifs FROM pairs
+           EXCEPT SELECT tf_id, target_id, n_sites, n_motifs FROM v3_rebuild_pairs)",
+    )?;
+    let _ = conn.execute("DROP TABLE IF EXISTS v3_rebuild_pairs", []);
+    if missing != 0 || extra != 0 {
+        problems.push(format!(
+            "pairs does not equal the best-policy reconstruction from motif_target \
+             ({missing} expected rows missing, {extra} rows not explained by motif_target)"
+        ));
+    }
+
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        fail(problems)
+    }
+}
+
+fn fail(problems: Vec<String>) -> Result<()> {
+    let mut message = format!("database failed {} schema-v3 check(s):", problems.len());
+    for problem in problems {
+        message.push_str("\n  - ");
+        message.push_str(&problem);
+    }
+    bail!(message)
+}
+
 
 fn cmd_classify_tfs(args: &[String]) -> Result<()> {
     use regutrace_core::{hmmer, tf_classification};
@@ -2926,6 +3378,7 @@ fn main() {
         Some("scan") => cmd_scan(&args[1..]),
         Some("validate") => cmd_validate(&args[1..]),
         Some("pipeline") => pipeline::run(&args[1..]),
+        Some("background") => background::run(&args[1..]),
         Some("trace") => trace::run(&args[1..]),
         Some("import") => cmd_import(&args[1..]),
         Some("export") => cmd_export(&args[1..]),
@@ -3449,5 +3902,52 @@ ACGTACGTACGT
             assert!((v - 0.25).abs() < 1e-12, "v={v}");
         }
         assert!(parse_background("1e308,1e-308,1e-308,1e-308").is_err());
+    }
+
+    #[test]
+    fn default_background_mode_is_empirical() {
+        // The uniform i.i.d. null mis-calibrates p-values on A/T-rich genomes:
+        // on HF1 the observed per-motif promoter coverage correlates with the
+        // composition-matched expectation at r=0.94 but with the uniform one at
+        // only r=0.24. Empirical is the default so a plain scan is calibrated.
+        let args = parse_scan_args(&[]).unwrap();
+        assert_eq!(args.background_mode, "empirical");
+        assert!(args.uses_phase3_scan());
+    }
+
+    #[test]
+    fn explicit_background_implies_uniform_mode() {
+        // Four user-supplied frequencies are the whole null; they must not be
+        // ignored because the default mode is now fitted from the promoters.
+        let args = parse_scan_args(&[
+            "--background".to_owned(),
+            "0.35,0.15,0.15,0.35".to_owned(),
+        ])
+        .unwrap();
+        assert_eq!(args.background_mode, "uniform");
+        assert!(args.background_explicit);
+        assert!(!args.uses_phase3_scan());
+    }
+
+    #[test]
+    fn explicit_uniform_mode_is_accepted_and_routed_to_the_legacy_scan() {
+        let args = parse_scan_args(&[
+            "--background-mode".to_owned(),
+            "uniform".to_owned(),
+        ])
+        .unwrap();
+        assert_eq!(args.background_mode, "uniform");
+        assert!(!args.uses_phase3_scan());
+    }
+
+    #[test]
+    fn explicit_background_with_empirical_mode_is_rejected() {
+        assert!(parse_scan_args(&[
+            "--background".to_owned(),
+            "0.35,0.15,0.15,0.35".to_owned(),
+            "--background-mode".to_owned(),
+            "empirical".to_owned(),
+        ])
+        .is_err());
     }
 }
